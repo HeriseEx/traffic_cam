@@ -1,0 +1,72 @@
+name: traffic-verifier
+services:
+  api:
+    build: .
+    image: traffic-verifier:local
+    restart: unless-stopped
+    environment:
+      TRAFFIC_API_TOKEN: ${TRAFFIC_API_TOKEN:?Run download_model.py first}
+      TRAFFIC_OPEN: ${TRAFFIC_OPEN:-1}
+      TRAFFIC_CORS: ${TRAFFIC_CORS:-http://127.0.0.1:61612,https://127.0.0.1:61612,http://localhost:61612,https://localhost:61612,https://cam.muqin.ccwu.cc}
+      TRAFFIC_DATA_DIR: /data
+    ports:
+      # Uncommon host port for Nginx Proxy Manager → https://traffic.muqin.ccwu.cc
+      - "0.0.0.0:61616:8000"
+    volumes:
+      - ./data:/data
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+  worker:
+    image: traffic-verifier:local
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    environment:
+      TRAFFIC_DATA_DIR: /data
+      TRAFFIC_MODEL: /models/yolox_s.onnx
+      TRAFFIC_THREADS: "4"
+    volumes:
+      - ./data:/data
+      - ./models:/models:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+  client:
+    image: python:3.13-slim
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "webserve.py"]
+    environment:
+      PORT: "80"
+      HOST: "0.0.0.0"
+      TRAFFIC_API: http://api:8000
+    ports:
+      # HTTP so NPM can terminate TLS: cam.muqin.ccwu.cc → 127.0.0.1:61612
+      # LAN camera on Windows: python webserve.py (HTTPS on 61612, accept the cert)
+      - "0.0.0.0:61612:80"
+    volumes:
+      - ./web:/app/web:ro
+      - ./webserve.py:/app/webserve.py:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      options:
+        max-size: "4m"
+        max-file: "2"

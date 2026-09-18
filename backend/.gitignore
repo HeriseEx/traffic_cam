@@ -1,0 +1,9 @@
+.venv/
+data/
+.env
+__pycache__/
+models/*.onnx
+models/*.part
+models/plate/*.onnx
+validation/
+web/certs/

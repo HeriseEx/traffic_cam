@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>行迹 · 采集客户端</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/"><span class="logo">行</span><span>行迹 <small>Web 客户端</small></span></a>
+    <div class="header-actions">
+      <span id="connection" class="pill">正在连接</span>
+      <button id="settingsBtn" class="quiet" type="button">服务器</button>
+    </div>
+  </header>
+  <main>
+    <section class="stage">
+      <div class="preview">
+        <video id="live" playsinline muted autoplay></video>
+        <canvas id="overlay"></canvas>
+        <div id="hud" class="hud">
+          <span id="vehicles">车辆 —</span>
+          <span id="plate">车牌 —</span>
+          <span id="signal">信号灯 —</span>
+          <span id="verdict">片段判定 —</span>
+          <span id="hint"></span>
+        </div>
+      </div>
+      <div class="controls">
+        <button id="cam" class="primary" type="button">开启相机</button>
+        <button id="mark" type="button" disabled>标记重点</button>
+        <label class="file">导入视频<input id="file" type="file" accept="video/*"></label>
+      </div>
+      <p id="status" class="status">打开即自动登录。局域网请用 https://电脑IP:61612（证书警告点继续）。HTTP 可导入视频，相机需要 HTTPS。</p>
+    </section>
+    <aside class="records">
+      <div class="section-title"><h2>业务记录</h2><button id="refresh" class="quiet" type="button">刷新</button></div>
+      <div id="recordList" class="record-list"></div>
+    </aside>
+  </main>
+  <dialog id="settings">
+    <form id="settingsForm">
+      <p class="eyebrow">SERVER</p>
+      <h2>服务地址</h2>
+      <p>默认远程 API 为 traffic.muqin.ccwu.cc。本页部署在 cam.muqin.ccwu.cc（本机 61612）。局域网 61612 留空即同页转发，避免 HTTPS 页请求 HTTP 接口。</p>
+      <label>API 根地址<input id="api" placeholder="留空 = 本页 /v1"></label>
+      <p id="settingsError" class="error"></p>
+      <button class="primary" type="submit">保存并连接</button>
+      <button id="closeSettings" type="button" class="quiet">关闭</button>
+    </form>
+  </dialog>
+  <div id="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

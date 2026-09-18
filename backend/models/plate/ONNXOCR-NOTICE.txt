@@ -1,0 +1,3 @@
+OnnxOCR license-plate ONNX: jingsongliu/onnxocr_model, Apache-2.0
+https://huggingface.co/jingsongliu/onnxocr_model
+https://github.com/jingsongliujing/OnnxOCR

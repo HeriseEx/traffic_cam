@@ -1,0 +1,3 @@
+PP-OCRv5 recognition ONNX: PaddlePaddle / PaddleOCR, Apache-2.0
+https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_rec_onnx
+https://huggingface.co/PaddlePaddle/PP-OCRv5_server_rec_onnx
