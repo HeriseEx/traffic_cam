@@ -24,6 +24,151 @@ import numpy as np
 
 
 class BackendTest(unittest.TestCase):
+    def test_legacy_device_session_migrates_without_resurrection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data=Path(directory), reserve_bytes=0)
+            store = Store(settings)
+            session = 'legacy-client-session'
+            digest = hashlib.sha256(session.encode()).hexdigest()
+            with store.connection() as db:
+                db.execute('INSERT INTO clients VALUES(?,?,?,?,?,?,?,?,?)',
+                    ('client-old', 'device-old', 'android', 'phone', '2', '127.0.0.1', digest, time.time(), time.time()))
+            migrated = Store(settings)
+            self.assertTrue(migrated.client_ok(session))
+            newer = migrated.hello('device-old', 'android', 'phone', '2', '127.0.0.2')
+            self.assertEqual(newer['client_id'], 'client-old')
+            self.assertEqual(migrated.overview()['client_count'], 1)
+            self.assertTrue(migrated.client_ok(session))
+            migrated.revoke_session(session)
+            restarted = Store(settings)
+            self.assertFalse(restarted.client_ok(session))
+            self.assertTrue(restarted.client_ok(newer['session']))
+            with restarted.connection() as db:
+                db.execute('UPDATE client_sessions SET expires_at=?', (time.time()-1,))
+            self.assertFalse(Store(settings).client_ok(newer['session']))
+
+    def test_capture_proxy_preserves_media_headers(self):
+        import http.client
+        import http.server
+        import threading
+        from unittest.mock import patch
+        from urllib.parse import urlparse
+        import webserve
+
+        seen = []
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(dict(self.headers))
+                partial = self.headers.get('Range') == 'bytes=0-3'
+                self.send_response(206 if partial else 200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Content-Length', '4' if partial else '8')
+                self.send_header('Set-Cookie', 'traffic_client=test; HttpOnly; SameSite=Lax')
+                self.send_header('Set-Cookie', 'traffic_device=device; HttpOnly; SameSite=Lax')
+                if partial:
+                    self.send_header('Content-Range', 'bytes 0-3/8')
+                self.end_headers()
+                if self.command != 'HEAD':
+                    self.wfile.write(b'abcd' if partial else b'abcdefgh')
+            do_HEAD = do_GET
+            def log_message(self, *args):
+                pass
+
+        class Proxy(webserve.Handler):
+            def log_message(self, *args):
+                pass
+
+        with http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream) as upstream, \
+             http.server.ThreadingHTTPServer(('127.0.0.1', 0), Proxy) as proxy:
+            threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (upstream, proxy)]
+            for thread in threads:
+                thread.start()
+            try:
+                with patch.object(webserve, 'UPSTREAM', urlparse(f'http://127.0.0.1:{upstream.server_port}')):
+                    for method, ranged, expected_size in [('GET', False, '8'), ('GET', True, '4'), ('HEAD', False, '8')]:
+                        conn = http.client.HTTPConnection('127.0.0.1', proxy.server_port, timeout=5)
+                        try:
+                            headers = {'Cookie': 'traffic_client=test'}
+                            if ranged:
+                                headers['Range'] = 'bytes=0-3'
+                            conn.request(method, '/v1/tasks/example/video', headers=headers)
+                            response = conn.getresponse()
+                            self.assertEqual(response.status, 206 if ranged else 200)
+                            self.assertEqual(response.headers.get_all('Content-Length'), [expected_size])
+                            self.assertEqual(len(response.headers.get_all('Set-Cookie')), 2)
+                            self.assertEqual(response.read(), b'' if method == 'HEAD' else b'abcd' if ranged else b'abcdefgh')
+                            self.assertEqual(seen[-1]['Cookie'], 'traffic_client=test')
+                            if ranged:
+                                self.assertEqual(response.headers['Content-Range'], 'bytes 0-3/8')
+                        finally:
+                            conn.close()
+            finally:
+                for server in (proxy, upstream):
+                    server.shutdown()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+    def test_browser_media_cookies_and_persistent_device_identity(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from hello import code as hello_code
+        root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data=Path(directory), token='browser-regression-token-long-enough', reserve_bytes=0)
+            app = create_app(settings)
+            store = app.state.store
+
+            def hello(client, device):
+                stamp, nonce = int(time.time()), secrets.token_hex(16)
+                return client.post('/v1/hello', json={'device_id': device, 'platform': 'web', 'model': 'Same browser model',
+                    'ts': stamp, 'nonce': nonce, 'code': hello_code(device, 'web', stamp, nonce)})
+
+            with TestClient(app, base_url='https://testserver') as browser, TestClient(app, base_url='https://testserver') as other:
+                initial = hello(browser, 'persistent-browser-a')
+                self.assertEqual(initial.status_code, 200)
+                device = initial.json()
+                self.assertTrue(all('HttpOnly' in value and 'Secure' in value for value in initial.headers.get_list('set-cookie')))
+                # Reloads and a cleared/changed localStorage ID still resolve to the browser's signed device cookie.
+                for _ in range(3):
+                    resumed = hello(browser, str(uuid.uuid4())).json()
+                    self.assertEqual(resumed['client_id'], device['client_id'])
+                    self.assertEqual(resumed['device_id'], 'persistent-browser-a')
+                    self.assertEqual(resumed['session'], device['session'])
+                browser.cookies.delete('traffic_client')
+                self.assertEqual(hello(browser, 'recreated-storage-id').json()['client_id'], device['client_id'])
+                # Equal model and IP do not identify a device; two real browsers must remain distinct.
+                self.assertNotEqual(hello(other, 'persistent-browser-b').json()['client_id'], device['client_id'])
+                self.assertEqual(browser.get('/v1/overview').json()['client_count'], 2)
+                # Concurrent sessions on the same device remain valid without adding clients.
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    sessions = list(pool.map(lambda _: store.hello('persistent-browser-a', 'web', 'Same browser model', '2', '127.0.0.1'), range(6)))
+                self.assertTrue(all(row['client_id'] == device['client_id'] and store.client_ok(row['session']) for row in sessions))
+                self.assertTrue(store.client_ok(device['session']))
+                self.assertEqual(browser.get('/v1/overview').json()['client_count'], 2)
+                content = (root/'tests/traffic.mp4').read_bytes()
+                headers = {'X-Requested-With': 'traffic-console', 'X-Event-Metadata': json.dumps({'event_id': str(uuid.uuid4())}),
+                           'X-Video-SHA256': hashlib.sha256(content).hexdigest()}
+                task = browser.post('/v1/tasks', content=content, headers=headers).json()
+                video = f"/v1/tasks/{task['task_id']}/video"
+                preview = browser.get(video)
+                self.assertEqual(preview.status_code, 200)
+                self.assertEqual(preview.headers['content-type'], 'video/mp4')
+                fragment = browser.get(video, headers={'Range': 'bytes=0-31'})
+                self.assertEqual(fragment.status_code, 206)
+                self.assertEqual(fragment.content, preview.content[:32])
+                self.assertEqual(browser.head(video).headers['content-length'], str(len(preview.content)))
+                original = browser.get(video+'?original=true')
+                self.assertEqual(original.content, content)
+                self.assertIn('attachment', original.headers['content-disposition'])
+                clips = store.clips_dir(task['task_id']); clips.mkdir(parents=True)
+                (clips/'0.mp4').write_bytes(content)
+                self.assertEqual(browser.get(f"/v1/tasks/{task['task_id']}/clips/0", headers={'Range': 'bytes=0-31'}).status_code, 206)
+                self.assertEqual(browser.post('/v1/archive').status_code, 403)
+                self.assertEqual(browser.delete('/v1/session', headers={'X-Requested-With':'traffic-console'}).status_code, 200)
+                self.assertEqual(browser.get(video).status_code, 401)
+                self.assertEqual(browser.get(video+'?original=true').status_code, 401)
+                self.assertEqual(hello(browser, 'after-logout-device').json()['client_id'], device['client_id'])
+                self.assertEqual(browser.get('/v1/overview').json()['client_count'], 2)
+
     def test_mobile_capture_intervals_and_legacy_retries(self):
         from pydantic import ValidationError
         capture = {'camera_mode': 'moving', 'captured_at': 1700000000, 'duration_ms': 2000,

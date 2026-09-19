@@ -90,6 +90,10 @@ def create_app(settings=None):
             return
         if offered and store.pair_ok(offered):
             return
+        if store.client_ok(request.cookies.get('traffic_client', ''), ip):
+            if request.method not in ('GET', 'HEAD') and request.headers.get('x-requested-with') != 'traffic-console':
+                raise HTTPException(403, '缺少同源请求标识')
+            return
         cookie=request.cookies.get('traffic_session','')
         try:
             stamp,nonce,signature=cookie.split('.')
@@ -126,8 +130,11 @@ def create_app(settings=None):
         return response
 
     @app.delete('/v1/session',dependencies=[Depends(authorized)])
-    def logout():
-        response=JSONResponse({'ok':True});response.delete_cookie('traffic_session');return response
+    def logout(request: Request):
+        store.revoke_session(request.cookies.get('traffic_client', ''))
+        response=JSONResponse({'ok':True})
+        response.delete_cookie('traffic_session');response.delete_cookie('traffic_client')
+        return response
 
     @app.get("/health")
     def health():
@@ -137,7 +144,28 @@ def create_app(settings=None):
     def hello(request: Request, body: Hello):
         if not hello_ok(body.device_id, body.platform, body.ts, body.nonce, body.code):
             raise HTTPException(401, "握手校验失败")
-        return store.hello(body.device_id, body.platform, body.model.strip(), body.app_version, peer_ip(request))
+        device = body.device_id
+        previous = request.cookies.get('traffic_client', '') if body.platform == 'web' else ''
+        if body.platform == 'web':
+            # Device identity survives a new login and localStorage loss. It is not an authentication credential.
+            saved = request.cookies.get('traffic_device', '')
+            try:
+                identity, signature = saved.rsplit('.', 1)
+                expected = hmac.new(settings.token.encode(), f'device:{identity}'.encode(), 'sha256').hexdigest()
+                if 8 <= len(identity) <= 80 and hmac.compare_digest(signature, expected):
+                    device = identity
+                else:
+                    device = store.session_device(previous) or device
+            except ValueError:
+                device = store.session_device(previous) or device
+        result = store.hello(device, body.platform, body.model.strip(), body.app_version, peer_ip(request), previous)
+        response = JSONResponse(result)
+        if body.platform == 'web':
+            secure = request.url.scheme == 'https'
+            response.set_cookie('traffic_client', result['session'], httponly=True, samesite='lax', secure=secure, max_age=30*86400)
+            signature = hmac.new(settings.token.encode(), f'device:{device}'.encode(), 'sha256').hexdigest()
+            response.set_cookie('traffic_device', f'{device}.{signature}', httponly=True, samesite='lax', secure=secure, max_age=365*86400)
+        return response
 
     @app.post("/v1/tasks", dependencies=[Depends(authorized)])
     async def upload(request: Request, x_event_metadata: str = Header(), x_video_sha256: str = Header()):
@@ -291,7 +319,7 @@ def create_app(settings=None):
         # This records a real external receipt; it does not submit to any reporting service.
         return store.submitted(str(task_id),body.expected_revision,body.receipt)
 
-    @app.get('/v1/tasks/{task_id}/video',dependencies=[Depends(authorized)])
+    @app.api_route('/v1/tasks/{task_id}/video',methods=['GET', 'HEAD'],dependencies=[Depends(authorized)])
     def video(task_id:UUID,original:bool=False):
         record=store.get(str(task_id));path=store.video(str(task_id))
         if not record or record['status']=='EXPIRED' or not path.is_file():
@@ -339,7 +367,7 @@ def create_app(settings=None):
     def archive():
         return {"archived": store.archive_all()}
 
-    @app.get("/v1/tasks/{task_id}/clips/{index}", dependencies=[Depends(authorized)])
+    @app.api_route("/v1/tasks/{task_id}/clips/{index}", methods=['GET', 'HEAD'], dependencies=[Depends(authorized)])
     def clip_file(task_id: UUID, index: int):
         if not 0 <= index <= 99:
             raise HTTPException(404, "裁剪片段不存在")

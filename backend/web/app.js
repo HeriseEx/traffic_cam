@@ -23,7 +23,8 @@ function defaultApi() {
   return REMOTE;
 }
 function storedApi() {
-  const saved = localStorage.getItem('traffic-api');
+  let saved;
+  try { saved = localStorage.getItem('traffic-api'); } catch { return null; }
   if (saved == null) return null;
   if (location.protocol === 'https:' && saved.startsWith('http:')) return null;
   return saved;
@@ -88,17 +89,25 @@ async function sha256hex(data) {
   }
   return sha256sync(bytes);
 }
+let helloPromise=null;
 async function hello() {
+  if(helloPromise)return helloPromise;
+  helloPromise=registerDevice();
+  try{await helloPromise;}finally{helloPromise=null;}
+}
+async function registerDevice() {
   const ts = Math.floor(Date.now() / 1000), nonce = uuid().replace(/-/g, '');
-  let device = localStorage.getItem('traffic-device-id');
-  if (!device) { device = uuid(); localStorage.setItem('traffic-device-id', device); }
+  let device;
+  try { device = localStorage.getItem('traffic-device-id'); } catch {}
+  if (!device) device = uuid();
   const platform = 'web';
   const code = await sha256hex(`${device}\n${platform}\n${ts}\n${nonce}\n${SALT}`);
-  const response = await fetch(apiRoot + '/v1/hello', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const response = await fetch(apiRoot + '/v1/hello', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ device_id: device, platform, model: (navigator.userAgent || 'web').slice(0, 120), app_version: 'web-2.0', ts, nonce, code }) });
   const data = await response.json();
   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '握手失败');
   session = data.session;
+  try { localStorage.setItem('traffic-device-id', data.device_id || device); } catch {}
 }
 async function api(path, options = {}, retried = false) {
   if (!session) await hello();

@@ -47,7 +47,16 @@ class Store:
                     session_hash TEXT NOT NULL, created_at REAL NOT NULL, last_seen REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS client_session ON clients(session_hash);
+                CREATE TABLE IF NOT EXISTS client_sessions (
+                    session_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS sessions_client ON client_sessions(client_id);
             """)
+            # Migrate existing credentials once; browser tabs may each hold a valid session for one device.
+            db.execute('INSERT OR IGNORE INTO client_sessions SELECT session_hash,client_id,? FROM clients WHERE session_hash<>?',
+                       (time.time()+30*86400, ''))
+            db.execute("UPDATE clients SET session_hash='' WHERE session_hash<>''")
             columns = {row['name'] for row in db.execute('PRAGMA table_info(tasks)')}
             for name, declaration in {'revision': 'INTEGER NOT NULL DEFAULT 1',
                     'analysis_config': 'TEXT', 'scene': 'TEXT', 'review': 'TEXT',
@@ -218,6 +227,7 @@ class Store:
             return {'counts':counts,'total':sum(counts.values()),
                     'intervened':db.execute('SELECT COUNT(*) FROM tasks WHERE review IS NOT NULL').fetchone()[0],
                     'worker':dict(row) if row else None,
+                    'client_count':db.execute('SELECT COUNT(*) FROM clients').fetchone()[0],
                     'clients':[dict(item) for item in db.execute(
                         'SELECT client_id,platform,model,app_version,ip,created_at,last_seen FROM clients ORDER BY last_seen DESC LIMIT 50')]}
 
@@ -264,29 +274,48 @@ class Store:
             row = db.execute('SELECT expires_at FROM device_pairs WHERE code=?', (token,)).fetchone()
         return bool(row and row['expires_at'] > time.time())
 
-    def hello(self, device_id, platform, model, app_version, ip):
-        session = secrets.token_urlsafe(32)
-        digest = hashlib.sha256(session.encode()).hexdigest()
+    def hello(self, device_id, platform, model, app_version, ip, previous_session=''):
         now = time.time()
         with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('DELETE FROM client_sessions WHERE expires_at<=?', (now,))
             row = db.execute('SELECT client_id FROM clients WHERE device_id=?', (device_id,)).fetchone()
             if row:
-                db.execute("""UPDATE clients SET platform=?,model=?,app_version=?,ip=?,session_hash=?,last_seen=?
-                    WHERE device_id=?""", (platform, model, app_version, ip, digest, now, device_id))
+                db.execute("""UPDATE clients SET platform=?,model=?,app_version=?,ip=?,last_seen=?
+                    WHERE device_id=?""", (platform, model, app_version, ip, now, device_id))
                 client_id = row['client_id']
             else:
                 client_id = str(uuid.uuid4())
                 db.execute("""INSERT INTO clients(client_id,device_id,platform,model,app_version,ip,session_hash,created_at,last_seen)
                     VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (client_id, device_id, platform, model, app_version, ip, digest, now, now))
-        return {'client_id': client_id, 'session': session, 'platform': platform, 'model': model, 'ip': ip}
+                    (client_id, device_id, platform, model, app_version, ip, '', now, now))
+            prior_hash = hashlib.sha256(previous_session.encode()).hexdigest()
+            reuse = previous_session and db.execute('SELECT 1 FROM client_sessions WHERE session_hash=? AND client_id=?',
+                                                    (prior_hash, client_id)).fetchone()
+            session = previous_session if reuse else secrets.token_urlsafe(32)
+            digest = hashlib.sha256(session.encode()).hexdigest()
+            db.execute('INSERT OR REPLACE INTO client_sessions VALUES(?,?,?)', (digest, client_id, now+30*86400))
+        return {'client_id': client_id, 'device_id': device_id, 'session': session, 'platform': platform, 'model': model, 'ip': ip}
+
+    def session_device(self, session):
+        if not session or len(session)>80:
+            return None
+        digest = hashlib.sha256(session.encode()).hexdigest()
+        with self.connection() as db:
+            row = db.execute('''SELECT clients.device_id FROM client_sessions JOIN clients USING(client_id)
+                WHERE client_sessions.session_hash=? AND expires_at>?''', (digest, time.time())).fetchone()
+            return row['device_id'] if row else None
+
+    def revoke_session(self, session):
+        with self.connection() as db:
+            db.execute('DELETE FROM client_sessions WHERE session_hash=?', (hashlib.sha256(session.encode()).hexdigest(),))
 
     def client_ok(self, session, ip=''):
         if not session or len(session) > 80:
             return False
         digest = hashlib.sha256(session.encode()).hexdigest()
         with self.connection() as db:
-            row = db.execute('SELECT client_id FROM clients WHERE session_hash=?', (digest,)).fetchone()
+            row = db.execute('SELECT client_id FROM client_sessions WHERE session_hash=? AND expires_at>?', (digest, time.time())).fetchone()
             if not row:
                 return False
             if ip:

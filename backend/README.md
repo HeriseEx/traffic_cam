@@ -63,7 +63,9 @@ HyperLPR3 检测车牌、透视矫正、CTC 识别大陆车牌，按置信度和
 
 ## API
 
-业务接口要求 Bearer token；网页登录换取 8 小时 HttpOnly、SameSite=Strict 会话。Cookie 写操作另校验 `X-Requested-With: traffic-console`，不开放跨域访问。时间为 Unix 秒，`revision` 用于防止覆盖并发修改。
+业务接口接受 Bearer 会话或登录 Cookie。网页自动 `POST /v1/hello` 后同时获得 30 天 HttpOnly、SameSite=Lax Cookie，播放器、裁剪片段和原片下载可以直接沿用登录态，无须手填令牌或在 URL 中传令牌。管理员令牌登录仍使用 8 小时会话。Cookie 写操作另校验 `X-Requested-With: traffic-console`；跨域仅允许配置中的前端来源。时间为 Unix 秒，`revision` 用于防止覆盖并发修改。
+
+设备和会话分别存储：同一设备刷新页面、重新登录或打开多个标签页，只更新设备最后访问时间，不增加设备数，也不会使其他标签页退出。网页使用本地持久 ID，并用签名设备 Cookie 恢复丢失的本地 ID；Android 使用安装目录中的持久 ID。清除全部浏览器站点数据、换浏览器配置或重装 App 后会成为新设备；不会仅凭型号/IP 合并设备。旧会话在启动时自动迁移，历史设备记录保留。概览显示“已登记设备”，统计不受最近 50 条设备列表的限制。
 
 | 接口 | 用途 |
 | --- | --- |

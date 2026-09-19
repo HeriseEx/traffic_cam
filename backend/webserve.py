@@ -126,9 +126,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             payload = response.read()
             self.send_response(response.status)
             for key, value in response.getheaders():
-                if key.lower() not in {"transfer-encoding", "connection", "content-encoding"}:
+                if key.lower() not in {"transfer-encoding", "connection", "content-encoding", "content-length"}:
                     self.send_header(key, value)
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", response.getheader('Content-Length', '0') if method == 'HEAD' else str(len(payload)))
             self.end_headers()
             if method != "HEAD":
                 self.wfile.write(payload)

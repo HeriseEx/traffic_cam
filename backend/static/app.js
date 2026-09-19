@@ -25,18 +25,25 @@ async function sha256hex(text){
   const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
   return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
-let session='';
+let session='', sessionPromise=null;
+let mediaRetry=false;
 async function ensureSession(){
   if(session)return;
-  const ts=Math.floor(Date.now()/1000),nonce=crypto.randomUUID().replaceAll('-','');
-  let device=localStorage.getItem('traffic-device-id');
-  if(!device){device=crypto.randomUUID();localStorage.setItem('traffic-device-id',device);}
-  const platform='web';
-  const code=await sha256hex(`${device}\n${platform}\n${ts}\n${nonce}\ntraffic-hello-v1`);
-  const response=await fetch('/v1/hello',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:device,platform,model:(navigator.userAgent||'web').slice(0,120),app_version:'2.0',ts,nonce,code})});
-  const data=await response.json();
-  if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'握手失败');
-  session=data.session;
+  if(sessionPromise)return sessionPromise;
+  sessionPromise=(async()=>{
+    const ts=Math.floor(Date.now()/1000),nonce=crypto.randomUUID().replaceAll('-','');
+    let device;
+    try{device=localStorage.getItem('traffic-device-id');}catch{}
+    if(!device)device=crypto.randomUUID();
+    const platform='web';
+    const code=await sha256hex(`${device}\n${platform}\n${ts}\n${nonce}\ntraffic-hello-v1`);
+    const response=await fetch('/v1/hello',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:device,platform,model:(navigator.userAgent||'web').slice(0,120),app_version:'2.0',ts,nonce,code})});
+    const data=await response.json();
+    if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'握手失败');
+    session=data.session;
+    try{localStorage.setItem('traffic-device-id',data.device_id||device);}catch{}
+  })();
+  try{await sessionPromise;}finally{sessionPromise=null;}
 }
 async function api(path, options={}, retried=false) {
   await ensureSession();
@@ -64,7 +71,7 @@ async function refresh(){
     $('countProcessing').textContent=(overview.counts.QUEUED||0)+(overview.counts.PROCESSING||0);
     $('countDone').textContent=overview.counts.ANALYZED||0;$('countReview').textContent=overview.intervened;
     const clients=overview.clients||[];
-    $('countClients').textContent=clients.length;
+    $('countClients').textContent=overview.client_count??clients.length;
     $('clientList').textContent=clients.slice(0,8).map(c=>`${c.platform} · ${c.model} · ${c.ip||'—'}`).join('；')||'尚无客户端';
     const online=overview.worker && Date.now()/1000-overview.worker.heartbeat<30;
     $('workerState').textContent=online?'自动处理运行中':'工作进程未就绪';
@@ -92,7 +99,7 @@ function renderRecords(){
 }
 async function selectTask(id){
   const [task,audit]=await Promise.all([api('/v1/tasks/'+id),api('/v1/tasks/'+id+'/audit')]);
-  const changedVideo=state.task?.task_id!==id;state.task=task;state.dirty=false;state.scene=structuredClone(task.scene||{});state.draw=null;state.points=[];
+  const changedVideo=state.task?.task_id!==id||!!$('video').error;state.task=task;state.dirty=false;state.scene=structuredClone(task.scene||{});state.draw=null;state.points=[];
   $('empty').hidden=true;$('selected').hidden=false;$('changed').hidden=true;
   $('taskTime').textContent=date(task.created_at);$('taskTitle').textContent=title(task.metadata.trigger||'import')+' · '+(task.effective_result?.plate||'车牌未确认');
   $('taskId').textContent=task.event_id;$('taskStatus').replaceWith(Object.assign(badge(task.status),{id:'taskStatus'}));
@@ -105,7 +112,7 @@ async function selectTask(id){
   $('reviewFields').disabled=!editable;$('reviewLock').textContent=editable?'自动结果已经生效，必要时在此纠正。':(task.submission_status==='SUBMITTED'?'已提交记录只读。':'分析完成后可进行人工干预。');
   $('reanalyze').disabled=!editable||task.status==='EXPIRED';$('fixedCamera').checked=!!state.scene.fixed_camera;
   $('videoError').hidden=true;$('download').href=`/v1/tasks/${id}/video?original=true`;
-  if(changedVideo){state.clipStart=0;$('video').src=`/v1/tasks/${id}/video`;$('video').load();}
+  if(changedVideo){mediaRetry=false;state.clipStart=0;$('video').src=`/v1/tasks/${id}/video`;$('video').load();}
   $('videoInfo').textContent=ai.video?`${ai.video.width}×${ai.video.height} · ${ai.video.duration_seconds.toFixed(1)} 秒 · ${ai.sampled_frames} 采样帧`:title(task.status);
   $('plateEvidence').replaceChildren();
   const plates=[...(ai.plates||[])].sort((a,b)=>plateTrust(b)-plateTrust(a)||(b.hits||0)-(a.hits||0));
@@ -115,7 +122,7 @@ async function selectTask(id){
     const b=element('button',undefined,'plate-card ranked');
     b.style.setProperty('--plate-bg',tone.bg);b.style.setProperty('--plate-fg',tone.fg);
     b.append(element('strong',plate.text),element('small',`${plate.stable?'多帧一致':'待确认'} · ${plate.hits} 帧 · ${Math.round(plate.confidence*100)}%`));
-    b.onclick=()=>{$('video').currentTime=plate.evidence_time;$('video').pause();draw();};
+    b.onclick=()=>{const video=$('video'),src=`/v1/tasks/${id}/video`;state.clipStart=0;video.pause();if(video.getAttribute('src')!==src){video.src=src;video.load();}video.currentTime=plate.evidence_time;draw();};
     $('plateEvidence').append(b);
   });
   if(!plates.length)$('plateEvidence').append(element('p','尚无满足阈值的中文车牌。小尺寸、模糊或非中国大陆车牌可能无法识别。','muted'));
@@ -143,7 +150,14 @@ function draw(){
 function calibrationHint(){ $('calibrationHint').textContent=state.draw?'请在视频中点击两点，标定完成后重新分析。':`实线：${state.scene.solid_line?'已标定':'未标定'} · 通行方向：${state.scene.allowed_direction?'已标定':'未标定'}`;document.querySelector('.video-wrap').classList.toggle('calibrating',!!state.draw); }
 $('overlay').onclick=event=>{if(!state.draw)return;const rect=$('overlay').getBoundingClientRect(),box=layout();const point=[(event.clientX-rect.left-box.x)/box.w,(event.clientY-rect.top-box.y)/box.h];if(point.some(x=>x<0||x>1))return;state.points.push(point.map(x=>Math.round(x*10000)/10000));if(state.points.length===2){state.scene[state.draw]=state.points;state.points=[];state.draw=null;state.dirty=true;calibrationHint();}draw();};
 $('video').addEventListener('timeupdate',draw);$('video').addEventListener('loadedmetadata',draw);new ResizeObserver(draw).observe($('video'));$('showBoxes').onchange=draw;
-$('video').onerror=()=>{$('videoError').textContent='视频预览暂不可用，可能正在生成或视频已过期。可刷新任务或下载原片。';$('videoError').hidden=false;};
+$('video').addEventListener('loadeddata',()=>{$('videoError').hidden=true;});
+$('video').onerror=async()=>{
+  if(!mediaRetry){
+    mediaRetry=true;session='';
+    try{await ensureSession();$('video').load();return;}catch{}
+  }
+  $('videoError').textContent='视频预览暂不可用，可能正在生成或视频已过期。可刷新任务或下载原片。';$('videoError').hidden=false;
+};
 $('drawLine').onclick=()=>{state.draw='solid_line';state.points=[];$('video').pause();calibrationHint();};$('drawDirection').onclick=()=>{state.draw='allowed_direction';state.points=[];$('video').pause();calibrationHint();};
 $('clearScene').onclick=()=>{state.scene={};state.draw=null;state.points=[];state.dirty=true;$('fixedCamera').checked=false;calibrationHint();draw();};$('fixedCamera').onchange=()=>{state.scene.fixed_camera=$('fixedCamera').checked;state.dirty=true;};
 $('reviewForm').oninput=()=>state.dirty=true;
