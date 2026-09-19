@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = {records: [], task: null, offset: 0, config: null, dirty: false, scene: {}, draw: null, points: [], loading: false, clipStart: 0};
 const labels = {QUEUED:'排队中',PROCESSING:'分析中',ANALYZED:'分析完成',REJECTED:'未检出 / 无效',ERROR:'处理失败',EXPIRED:'已过期',
   UNKNOWN:'无法可靠判定',CANDIDATE:'发现疑似候选',CONFIRMED:'人工确认',VALID:'人工确认',INVALID:'人工标记无效',UNCERTAIN:'证据不足',RESET:'恢复 AI 结果',
-  NONE:'未发现违法',SOLID_LINE:'疑似压实线/不打灯变道',WRONG_WAY:'疑似逆行',RED_LIGHT:'疑似闯红灯',RESTRICTED_LANE:'疑似占用非机动车道',
+  NONE:'未发现违法',SOLID_LINE:'疑似压实线',LATERAL_MOVEMENT:'横向移动（待复核）',WRONG_WAY:'疑似逆行',RED_LIGHT:'疑似闯红灯',RESTRICTED_LANE:'疑似占用非机动车道',
   RED:'红灯',GREEN:'绿灯',YELLOW:'黄灯',OFF:'未见到灯',
   NEEDS_CALIBRATION:'缺少固定机位与道路标定',MOVING_CAMERA:'画面移动，暂停几何规则',INSUFFICIENT_BACKGROUND:'背景特征不足，无法判断机位',
   RED_LIGHT_CANDIDATE:'红灯稳定且前车继续接近，仅作候选',

@@ -3,7 +3,42 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Unit = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Point = tuple[Unit, Unit]
-Violation = Literal['UNKNOWN', 'NONE', 'SOLID_LINE', 'WRONG_WAY', 'RED_LIGHT', 'RESTRICTED_LANE']
+Violation = Literal['UNKNOWN', 'NONE', 'SOLID_LINE', 'WRONG_WAY', 'RED_LIGHT', 'RESTRICTED_LANE', 'LATERAL_MOVEMENT']
+
+
+class MobileIncident(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    track_id: int = Field(ge=1)
+    kind: Literal['RED_LIGHT', 'LATERAL_MOVEMENT']
+    start_ms: int = Field(ge=0, le=89000)
+    end_ms: int = Field(ge=0, le=89000)
+    plate: str | None = Field(default=None, max_length=16, pattern=r'^[\u4e00-\u9fffA-Z0-9·-]*$')
+    plate_confirmed: bool = False
+
+    @model_validator(mode='after')
+    def interval(self):
+        if self.end_ms < self.start_ms:
+            raise ValueError('事件结束早于开始')
+        if self.plate_confirmed and not self.plate:
+            raise ValueError('确认车牌不能为空')
+        return self
+
+
+class MobileCapture(BaseModel):
+    """Client hints kept separately from independent server verdicts; track IDs are clip-local."""
+    model_config = ConfigDict(extra='forbid')
+    camera_mode: Literal['moving'] = 'moving'
+    captured_at: float = Field(ge=0, allow_inf_nan=False)
+    duration_ms: int = Field(gt=0, lt=89000)
+    recording_gaps_ms: int = Field(ge=0, lt=89000)
+    prebuffer_truncated: bool = False
+    incidents: list[MobileIncident] = Field(default_factory=list, max_length=16)
+
+    @model_validator(mode='after')
+    def bounds(self):
+        if self.recording_gaps_ms > self.duration_ms or any(i.end_ms > self.duration_ms for i in self.incidents):
+            raise ValueError('事件或缓存间隙超出视频范围')
+        return self
 
 
 class Scene(BaseModel):

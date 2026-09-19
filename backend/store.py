@@ -305,7 +305,7 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM tasks WHERE event_id=?", (metadata["event_id"],)).fetchone()
             if existing:
-                previous = {'trigger':'import','trigger_text':'','scene':None,**json.loads(existing['metadata'])}
+                previous = {'trigger':'import','trigger_text':'','scene':None,'capture':None,**json.loads(existing['metadata'])}
                 if existing["sha256"] != sha256 or previous != metadata:
                     raise Conflict("event_id already exists with different content or metadata")
                 return self.decode(existing), False

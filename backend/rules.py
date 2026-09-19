@@ -292,7 +292,7 @@ def lane_changes(frames):
                 continue
             t=next((item[0] for item in window if abs(item[1]-window[0][1])>=.08), window[-1][0])
             result.append({
-                'type':'SOLID_LINE','track_id':track_id,'time_seconds':round(float(t),3),
+                'type':'LATERAL_MOVEMENT','track_id':track_id,'time_seconds':round(float(t),3),
                 'confidence':round(min(.55,.3+abs(delta)),4),
                 'reason':'横向明显变道；未标定实线、2fps 无法确认转向灯，需复核是否压实线或不打灯变道',
             })

@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from config import Settings
 from store import Conflict, Store
-from schemas import AnalysisConfig, Scene, Review, Reanalyze, SettingsUpdate, Submission
+from schemas import AnalysisConfig, Scene, Review, Reanalyze, SettingsUpdate, Submission, MobileCapture
 from model_catalog import catalog, plate_catalog, plate_installed, model_directory, PLATE_FILES as FILES, PLATE_MODELS
 from plates import PlateReader
 from signals import detect_lights, observe
@@ -40,6 +40,7 @@ class Event(BaseModel):
     trigger: Literal['manual', 'voice', 'automatic', 'import'] = 'import'
     trigger_text: str = Field(default='', max_length=160)
     scene: Scene | None = None
+    capture: MobileCapture | None = None
 
 
 class Hello(BaseModel):
@@ -130,7 +131,7 @@ def create_app(settings=None):
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "service": "traffic-api", "version": "0.2.0", "auth": "hello"}
+        return {"status": "ok", "service": "traffic-api", "version": "0.2.0", "auth": "hello", "capture_metadata": True}
 
     @app.post("/v1/hello")
     def hello(request: Request, body: Hello):
@@ -140,7 +141,7 @@ def create_app(settings=None):
 
     @app.post("/v1/tasks", dependencies=[Depends(authorized)])
     async def upload(request: Request, x_event_metadata: str = Header(), x_video_sha256: str = Header()):
-        if len(x_event_metadata) > 4096:
+        if len(x_event_metadata) > 12288:
             raise HTTPException(400, "Metadata too large")
         try:
             metadata = Event.model_validate_json(x_event_metadata).model_dump(mode="json")
@@ -220,35 +221,37 @@ def create_app(settings=None):
     @app.post('/v1/recognize-frame',dependencies=[Depends(authorized)])
     async def recognize_frame(request:Request):
         config=AnalysisConfig.model_validate(store.configuration()['config'])
+        want_vehicles=request.query_params.get('vehicles','').lower() in ('1','true','yes')
         data=bytearray()
         async with asyncio.timeout(15):
             async for chunk in request.stream():
                 data.extend(chunk)
-                if len(data)>2*1024*1024: raise HTTPException(413,'图像超过 2 MiB')
+                if len(data)>4*1024*1024: raise HTTPException(413,'图像超过 4 MiB')
         def recognize():
             nonlocal live_reader, live_detector, live_detect_key
             import cv2,numpy as np
-            from inference import Detector
             if not plate_lock.acquire(timeout=10): raise HTTPException(429,'车牌识别忙，请稍后重试')
             try:
                 image=cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
                 if image is None or image.shape[0]*image.shape[1]>3840*2160:
                     raise HTTPException(422,'图像无效或分辨率超限')
-                height,width=image.shape[:2]
                 vehicles,lamp_boxes=[],[]
-                try:
-                    key=(config.vehicle_model,config.vehicle_threshold)
-                    if live_detector is None or live_detect_key!=key:
-                        live_detector=Detector(settings,config)
-                        live_detect_key=key
-                    raw=live_detector.detect(image)
-                    lamp_boxes=[item['box'] for item in live_detector.lamps]
-                    vehicles=[{'label':item['label'],'score':item['score'],
-                        'box_normalized':[round(item['box'][0]/width,5),round(item['box'][1]/height,5),
-                                          round(item['box'][2]/width,5),round(item['box'][3]/height,5)]}
-                        for item in raw]
-                except Exception:
-                    vehicles,lamp_boxes=[],[]
+                if want_vehicles:
+                    from inference import Detector
+                    height,width=image.shape[:2]
+                    try:
+                        key=(config.vehicle_model,config.vehicle_threshold)
+                        if live_detector is None or live_detect_key!=key:
+                            live_detector=Detector(settings,config)
+                            live_detect_key=key
+                        raw=live_detector.detect(image)
+                        lamp_boxes=[item['box'] for item in live_detector.lamps]
+                        vehicles=[{'label':item['label'],'score':item['score'],
+                            'box_normalized':[round(item['box'][0]/width,5),round(item['box'][1]/height,5),
+                                              round(item['box'][2]/width,5),round(item['box'][3]/height,5)]}
+                            for item in raw]
+                    except Exception:
+                        vehicles,lamp_boxes=[],[]
                 lights=detect_lights(image,lamp_boxes)
                 plates=[]
                 if config.plate_enabled:

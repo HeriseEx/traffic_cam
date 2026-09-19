@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app import create_app
+from app import create_app, Event
 from config import Settings
 from inference import Detector, Tracker, clip_windows, bind_plates
 from store import Store
@@ -24,6 +24,18 @@ import numpy as np
 
 
 class BackendTest(unittest.TestCase):
+    def test_mobile_capture_intervals_and_legacy_retries(self):
+        from pydantic import ValidationError
+        capture = {'camera_mode': 'moving', 'captured_at': 1700000000, 'duration_ms': 2000,
+                   'recording_gaps_ms': 20, 'incidents': [{'track_id': 1, 'kind': 'RED_LIGHT',
+                   'start_ms': 200, 'end_ms': 1400, 'plate': '川A12345', 'plate_confirmed': True}]}
+        event = {'event_id': str(uuid.uuid4()), 'capture': capture}
+        self.assertEqual(Event.model_validate(event).capture.incidents[0].track_id, 1)
+        for broken in ({**capture, 'duration_ms': 100}, {**capture, 'captured_at': float('nan')},
+                       {**capture, 'incidents': [{**capture['incidents'][0], 'start_ms': 1900}]}):
+            with self.assertRaises(ValidationError):
+                Event.model_validate({**event, 'capture': broken})
+
     def test_review_model_switch_changes_video_and_submission_lock(self):
         root=Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as directory:
@@ -216,7 +228,7 @@ class BackendTest(unittest.TestCase):
         self.assertTrue(all(p['text']!='冀A8BX43' for p in ranked))
         slide=[{'time_seconds':i*.5,'vehicles':[{'track_id':7,'score':.9,
             'box_normalized':[.52-i*.03,.45,.66-i*.03,.62]}]} for i in range(6)]
-        self.assertEqual(lane_changes(slide)[0]['type'],'SOLID_LINE')
+        self.assertEqual(lane_changes(slide)[0]['type'],'LATERAL_MOVEMENT')
         self.assertEqual(lane_changes(slide)[0]['time_seconds'],1.5)
         two=[]
         for t0 in (0,20):
@@ -262,8 +274,11 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(clip_windows([{**plated,'time_seconds':40}],80,red),[])
         self.assertEqual([v['plate'] for v in bind_plates(
             [{'type':'SOLID_LINE','track_id':1},{'type':'RED_LIGHT','track_id':2,'plate':'京AM0H772'}],
-            [{'plates':[{'text':'冀A8BX43','track_id':1},{'text':'川A8BX43','track_id':1}]}],
+            [{'plates':[{'text':'冀A8BX43','track_id':1}]}, {'plates':[{'text':'川A8BX43','track_id':1}]}],
             [{'text':'川A8BX43','stable':True}])], ['川A8BX43'])
+        self.assertEqual(bind_plates([{'type':'RED_LIGHT','track_id':2,'plate':'川A8BX43'}],
+            [{'plates':[{'text':'川A8BX43','track_id':1}]} for _ in range(3)],
+            [{'text':'川A8BX43','stable':True}]), [])
         self.assertEqual(bind_plates([{'type':'SOLID_LINE','track_id':9,'plate':'京AM0H772'}],
             [{'plates':[{'text':'京AM0H772','track_id':9}]}],
             [{'text':'京AM0H772','stable':False}]), [])
@@ -305,6 +320,9 @@ class BackendTest(unittest.TestCase):
             app = create_app(settings)
             store = app.state.store
             detector = Detector(settings)
+            # This queue/vehicle test deliberately does not run the separate plate reader.
+            configuration = store.configuration()
+            store.configure(configuration['revision'], {**configuration['config'], 'plate_enabled': False})
             content = (root / "tests/traffic.mp4").read_bytes()
             event = {"event_id": str(uuid.uuid4())}
 
@@ -335,7 +353,7 @@ class BackendTest(unittest.TestCase):
                 # v1 records predate the optional trigger and scene fields.
                 with store.connection() as db:
                     old=store.get(task_id)['metadata']
-                    for key in ('trigger','trigger_text','scene'): old.pop(key)
+                    for key in ('trigger','trigger_text','scene','capture'): old.pop(key)
                     db.execute('UPDATE tasks SET metadata=? WHERE task_id=?',(json.dumps(old),task_id))
                 self.assertEqual(upload(client).status_code,200)
                 self.assertEqual(upload(client, metadata={**event, "candidate_type": "RED_LIGHT"}).status_code, 409)

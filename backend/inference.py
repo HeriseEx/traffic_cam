@@ -261,7 +261,7 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
     config=config or AnalysisConfig(sample_fps=settings.sample_fps)
     started = time.monotonic()
     video = probe(path, settings)
-    tracker, counts, frames = Tracker(), Counter(), []
+    tracker, counts, frames = Tracker(max_age=max(1, round(config.sample_fps * 3))), Counter(), []
     motion = MotionGate()
     signals = SignalMachine()
     through = ThroughLamp()
@@ -360,7 +360,7 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
                 reds.extend(red_during_laterals(frames, laterals, {item['track_id'] for item in reds}))
             reds=[item for item in reds if not turned_from_green(frames, item['track_id'], item['time_seconds'])]
         violations=[*reds,*violations]
-        violations=bind_plates(violations, frames, plates)
+        violations=bind_plates(violations, frames, plates, config.plate_min_hits)
         red=next((item for item in violations if item.get('type')=='RED_LIGHT'), None)
         if red:
             assessment='RED_LIGHT_CANDIDATE'
@@ -385,16 +385,23 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
     }
 
 
-def bind_plates(violations, frames, plates):
+def bind_plates(violations, frames, plates, min_hits=2):
     """Keep a candidate only when a multi-frame plate is on the same track."""
     ok={p['text'] for p in plates if p.get('stable') and p.get('text')}
     canon={p['text'][1:]:p['text'] for p in plates if p.get('text') in ok and len(p['text'])>1}
     for violation in violations:
-        evidence=[p for f in frames for p in f.get('plates') or [] if p.get('track_id')==violation.get('track_id')]
-        mapped=[canon[p['text'][1:]] for p in evidence if len(p.get('text') or '')>1 and p['text'][1:] in canon]
+        mapped=[]
+        for frame in frames:
+            evidence=[p for p in frame.get('plates') or [] if p.get('track_id')==violation.get('track_id')]
+            vote={canon[p['text'][1:]] for p in evidence if len(p.get('text') or '')>1 and p['text'][1:] in canon}
+            # Multiple reads of one frame are one vote; conflicting reads cannot confirm a vehicle.
+            if len(vote)==1:
+                mapped.extend(vote)
+        votes=Counter(mapped)
+        mapped=[text for text,count in votes.items() if count>=min_hits]
         if mapped:
-            violation['plate']=Counter(mapped).most_common(1)[0][0]
-        elif violation.get('plate') not in ok:
+            violation['plate']=max(mapped,key=votes.get)
+        else:
             violation.pop('plate', None)
     return [item for item in violations if item.get('plate') in ok]
 

@@ -218,7 +218,7 @@ async function frames() {
       ctx.drawImage(video, 0, 0);
       const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
       if (blob && blob.size < 2 * 1024 * 1024) {
-        try { drawLive(await api('/v1/recognize-frame', { method: 'POST', body: blob, headers: { 'Content-Type': 'image/jpeg' } }), ox, overlay, video); }
+        try { drawLive(await api('/v1/recognize-frame?vehicles=1', { method: 'POST', body: blob, headers: { 'Content-Type': 'image/jpeg' } }), ox, overlay, video); }
         catch (error) { if (!String(error.message).includes('429')) $('plate').textContent = '车牌 —'; }
       }
       if (!recording && parts.length && Date.now() - parts[0].t > 35000) await finalizeClip();
