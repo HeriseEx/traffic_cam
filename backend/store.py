@@ -52,6 +52,12 @@ class Store:
                     expires_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS sessions_client ON client_sessions(client_id);
+                CREATE TABLE IF NOT EXISTS settings_security (
+                    id INTEGER PRIMARY KEY CHECK(id=1), password_hash TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+                    window_started REAL NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO settings_security(id) VALUES(1);
             """)
             # Migrate existing credentials once; browser tabs may each hold a valid session for one device.
             db.execute('INSERT OR IGNORE INTO client_sessions SELECT session_hash,client_id,? FROM clients WHERE session_hash<>?',
@@ -151,11 +157,18 @@ class Store:
             row = db.execute('SELECT * FROM runtime_settings WHERE id=1').fetchone()
             return {'revision': row['revision'], 'config': json.loads(row['config'])}
 
-    def configure(self, expected, config):
+    def configure(self, expected, config, password_revision=None):
         with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if password_revision is not None:
+                security = db.execute('SELECT revision FROM settings_security WHERE id=1').fetchone()
+                if security['revision'] != password_revision:
+                    raise Conflict('管理密码已更新，请输入新密码后重试。')
             if not db.execute('UPDATE runtime_settings SET config=?,revision=revision+1 WHERE id=1 AND revision=?',
                               (json.dumps(config), expected)).rowcount:
                 raise Conflict('配置已更新，请刷新后重试')
+            if password_revision is not None:
+                db.execute('UPDATE settings_security SET attempts=0,window_started=0 WHERE id=1')
         return self.configuration()
 
     def audit(self, task_id):

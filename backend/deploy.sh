@@ -22,3 +22,4 @@ docker compose up -d --build --wait
 echo "Listening on 127.0.0.1:61616 — NPM: traffic.muqin.ccwu.cc → http://127.0.0.1:61616"
 echo "Web client on 127.0.0.1:61612 — NPM: cam.muqin.ccwu.cc → http://127.0.0.1:61612"
 echo "Open hello: phones/web/iOS POST /v1/hello, no token to type. NPM should forward X-Real-IP."
+echo "Settings edits require a separate password. Initialize/reset: docker compose exec api python settings_password.py set"

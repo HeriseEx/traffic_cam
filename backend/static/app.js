@@ -53,7 +53,7 @@ async function api(path, options={}, retried=false) {
   const response=await fetch(path,{...next,headers,credentials:'same-origin'});
   if(response.status===401 && !retried){session='';return api(path,options,true);}
   const data=await response.json();
-  if(!response.ok){const detail=typeof data.detail==='string'?data.detail:JSON.stringify(data.detail);throw new Error(detail||`请求失败 ${response.status}`);}
+  if(!response.ok){const detail=typeof data.detail==='string'?data.detail:JSON.stringify(data.detail);const error=new Error(detail||`请求失败 ${response.status}`);error.status=response.status;error.retryAfter=Number(data.retry_after||response.headers.get('Retry-After')||0);throw error;}
   return data;
 }
 function run(action){return async event=>{event?.preventDefault();try{await action(event);}catch(error){toast(error.message);}};}
@@ -168,8 +168,42 @@ $('archive').onclick=run(async()=>{if(!confirm('归档将清除当前全部记�
 $('pair').onclick=run(async()=>{const out=await api('/v1/device-pair',{method:'POST'});toast(`在手机「访问令牌」填入：${out.code}（30分钟有效）`);});
 $('refresh').onclick=run(refresh);for(const id of ['statusFilter','reviewFilter'])$(id).onchange=()=>{state.offset=0;refresh();};$('search').oninput=()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>{state.offset=0;refresh();},300);};
 $('previous').onclick=()=>{state.offset=Math.max(0,state.offset-20);refresh();};$('next').onclick=()=>{state.offset+=20;refresh();};
-$('settingsButton').onclick=run(async()=>{state.config=await api('/v1/settings');const c=state.config.config;$('vehicleModel').replaceChildren();for(const model of state.config.models){const o=element('option',model.name+(model.installed?'':'（未下载）'));o.value=model.id;o.disabled=!model.installed;$('vehicleModel').append(o);}$('vehicleModel').value=c.vehicle_model;$('plateModel').replaceChildren();for(const model of state.config.plate_models||[]){const o=element('option',model.name+(model.installed?'':'（未下载）'));o.value=model.id;o.disabled=!model.installed;$('plateModel').append(o);}$('plateModel').value=c.plate_model||'hyperlpr3';for(const [id,key] of [['vehicleThreshold','vehicle_threshold'],['sampleFps','sample_fps'],['plateThreshold','plate_threshold'],['plateMinHits','plate_min_hits'],['threads','threads']])$(id).value=c[key];$('plateEnabled').checked=c.plate_enabled;$('rulesEnabled').checked=c.rules_enabled;$('modelReadiness').textContent=(state.config.plate_models||[]).filter(m=>m.installed).map(m=>m.name).join('；')||'车牌模型尚未下载';$('settingsDialog').showModal();});
-$('settingsForm').onsubmit=run(async()=>{const config={vehicle_model:$('vehicleModel').value,plate_model:$('plateModel').value,vehicle_threshold:+$('vehicleThreshold').value,sample_fps:+$('sampleFps').value,plate_threshold:+$('plateThreshold').value,plate_min_hits:+$('plateMinHits').value,threads:+$('threads').value,plate_enabled:$('plateEnabled').checked,rules_enabled:$('rulesEnabled').checked};await api('/v1/settings',{method:'PUT',json:{expected_revision:state.config.revision,config}});$('settingsDialog').close();toast('参数已保存，对之后的新任务生效。');});$('closeSettings').onclick=()=>$('settingsDialog').close();
+$('settingsButton').onclick=run(async()=>{state.config=await api('/v1/settings');const c=state.config.config;$('vehicleModel').replaceChildren();for(const model of state.config.models){const o=element('option',model.name+(model.installed?'':'（未下载）'));o.value=model.id;o.disabled=!model.installed;$('vehicleModel').append(o);}$('vehicleModel').value=c.vehicle_model;$('plateModel').replaceChildren();for(const model of state.config.plate_models||[]){const o=element('option',model.name+(model.installed?'':'（未下载）'));o.value=model.id;o.disabled=!model.installed;$('plateModel').append(o);}$('plateModel').value=c.plate_model||'hyperlpr3';for(const [id,key] of [['vehicleThreshold','vehicle_threshold'],['sampleFps','sample_fps'],['plateThreshold','plate_threshold'],['plateMinHits','plate_min_hits'],['threads','threads']])$(id).value=c[key];$('plateEnabled').checked=c.plate_enabled;$('rulesEnabled').checked=c.rules_enabled;$('modelReadiness').textContent=(state.config.plate_models||[]).filter(m=>m.installed).map(m=>m.name).join('；')||'车牌模型尚未下载';prepareSettingsAccess();$('settingsDialog').showModal();});
+let settingsBusy=false, settingsCooldown=0, settingsTimer=0;
+function updateSettingsAccess(){
+  const configured=state.config?.settings_security?.configured===true;
+  const seconds=Math.max(0,Math.ceil((settingsCooldown-Date.now())/1000));
+  $('settingsPassword').disabled=!configured||settingsBusy||seconds>0;
+  $('settingsSave').disabled=!configured||settingsBusy||seconds>0;
+  $('settingsFields').disabled=!configured||settingsBusy;
+  $('settingsSave').textContent=settingsBusy?'正在验证并保存…':seconds?`请 ${seconds} 秒后重试`:'验证密码并保存';
+  $('settingsSecurityHint').textContent=!configured?'尚未配置管理密码，当前只可查看。请在服务器初始化密码后重新打开。':seconds?'密码尝试已临时锁定。到期后可重试，也可由服务器管理员解除。':'每次保存需验证管理密码。连续尝试失败会临时锁定 15 分钟。';
+}
+function prepareSettingsAccess(){
+  $('settingsPassword').value='';$('settingsError').textContent='';
+  settingsCooldown=Date.now()+1000*(state.config?.settings_security?.retry_after||0);
+  clearInterval(settingsTimer);settingsTimer=setInterval(updateSettingsAccess,1000);updateSettingsAccess();
+}
+$('settingsForm').onsubmit=async event=>{
+  event.preventDefault();if($('settingsSave').disabled)return;
+  const config={vehicle_model:$('vehicleModel').value,plate_model:$('plateModel').value,vehicle_threshold:+$('vehicleThreshold').value,sample_fps:+$('sampleFps').value,plate_threshold:+$('plateThreshold').value,plate_min_hits:+$('plateMinHits').value,threads:+$('threads').value,plate_enabled:$('plateEnabled').checked,rules_enabled:$('rulesEnabled').checked};
+  const password=$('settingsPassword').value;$('settingsPassword').value='';$('settingsError').textContent='';
+  settingsBusy=true;updateSettingsAccess();
+  try{
+    await api('/v1/settings',{method:'PUT',json:{expected_revision:state.config.revision,config,password}});
+    $('settingsDialog').close();toast('密码验证通过，参数已保存。');
+  }catch(error){
+    $('settingsError').textContent=error.message;
+    if(error.retryAfter)settingsCooldown=Date.now()+error.retryAfter*1000;
+    if(error.status===503)state.config.settings_security={configured:false};
+    if(error.status===409){
+      $('settingsError').textContent+=' 请关闭并重新打开参数窗口，加载最新配置后再修改。';
+    }
+  }finally{settingsBusy=false;updateSettingsAccess();}
+};
+$('closeSettings').onclick=()=>$('settingsDialog').close();
+$('settingsDialog').addEventListener('close',()=>{$('settingsPassword').value='';clearInterval(settingsTimer);});
+$('settingsDialog').addEventListener('cancel',()=>{$('settingsPassword').value='';});
 $('loginDialog').addEventListener('cancel',event=>event.preventDefault());
 $('loginForm').onsubmit=async event=>{event.preventDefault();$('loginError').textContent='';try{await api('/v1/session',{method:'POST',headers:{Authorization:'Bearer '+$('token').value.trim()}});$('token').value='';$('loginDialog').close();await refresh();}catch(error){$('loginError').textContent=error.message;}};
 $('logout').onclick=run(async()=>{await api('/v1/session',{method:'DELETE'});state.task=null;state.records=[];$('selected').hidden=true;$('empty').hidden=false;$('video').removeAttribute('src');$('video').load();$('recordList').replaceChildren();$('loginDialog').showModal();});

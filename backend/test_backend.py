@@ -182,10 +182,12 @@ class BackendTest(unittest.TestCase):
                 Event.model_validate({**event, 'capture': broken})
 
     def test_review_model_switch_changes_video_and_submission_lock(self):
+        from settings_security import SettingsPassword
         root=Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as directory:
             settings=Settings(data=Path(directory),model=root/'models/yolox_s.onnx',token='test-console-token-not-production',reserve_bytes=0)
             app=create_app(settings);store=app.state.store
+            SettingsPassword(store).set_password('test-only-settings-passphrase')
             content=(root/'tests/traffic.mp4').read_bytes()
             auth={'Authorization':f'Bearer {settings.token}'}
             with TestClient(app) as client:
@@ -194,7 +196,7 @@ class BackendTest(unittest.TestCase):
                 self.assertEqual(login.status_code,200)
                 config=client.get('/v1/settings').json()
                 changed={**config['config'],'vehicle_model':'yolox_tiny','vehicle_threshold':.3,'plate_enabled':False}
-                body={'expected_revision':config['revision'],'config':changed}
+                body={'expected_revision':config['revision'],'config':changed,'password':'test-only-settings-passphrase'}
                 self.assertEqual(client.put('/v1/settings',json=body).status_code,403)
                 self.assertEqual(client.put('/v1/settings',headers={'X-Requested-With':'traffic-console'},json=body).status_code,200)
                 self.assertEqual(client.put('/v1/settings',headers=auth,json=body).status_code,409)
@@ -323,10 +325,10 @@ class BackendTest(unittest.TestCase):
                   'vehicles':[{'track_id':1,'score':.9,'box_normalized':[.4,.4,.6,.7-i*.04]}]} for i in range(6)]
         self.assertTrue(red_approach(leaving)['proceeding'])
         self.assertFalse(red_approach(leaving)['approaching'])
-        plates=[{'text':'川A8BX43','stable':True,'hits':4,'confidence':.99}]
+        plates=[{'text':'川A10001','stable':True,'hits':4,'confidence':.99}]
         hit=red_light_candidate({'color':'RED','stable':True,'since_seconds':0},found,plates)
         self.assertEqual(hit['type'],'RED_LIGHT')
-        self.assertEqual(hit['plate'],'川A8BX43')
+        self.assertEqual(hit['plate'],'川A10001')
         self.assertEqual(red_light_candidate({'color':'RED','stable':True},red_approach(leaving),plates)['type'],'RED_LIGHT')
         self.assertIsNone(red_light_candidate({'color':'RED','stable':True},red_approach(waiting),plates))
         self.assertIsNone(red_light_candidate({'color':'RED','stable':True},found,[]))
@@ -334,9 +336,9 @@ class BackendTest(unittest.TestCase):
         hood=[{'time_seconds':i*.5,'signal_observed':'RED',
                'vehicles':[{'track_id':1,'score':.9,'box_normalized':[.4,.42,.58,.55+i*.04]},
                            {'track_id':99,'score':.4,'box_normalized':[.15,.74,.92,.99]}],
-               'plates':[{'text':'川A8BX43','track_id':10+i,'box_normalized':[.46,.5,.52,.54]}]} for i in range(6)]
+               'plates':[{'text':'川A10001','track_id':10+i,'box_normalized':[.46,.5,.52,.54]}]} for i in range(6)]
         self.assertEqual(red_approach(hood)['track_id'],1)
-        self.assertTrue(red_approach(hood,'川A8BX43')['approaching'])
+        self.assertTrue(red_approach(hood,'川A10001')['approaching'])
         late=[{'time_seconds':12+i*.5,'signal_observed':'RED',
                'vehicles':[{'track_id':83,'score':.5,'box_normalized':[.2,.55,.85,.99]}]} for i in range(6)]
         self.assertTrue(red_approach(closing+late)['approaching'])
@@ -364,13 +366,13 @@ class BackendTest(unittest.TestCase):
             {'color':'RED','center':[.42,.456],'score':1,'area':10,'source':'HSV_GLOW'},
         ]),'RED')
         split=[{'time_seconds':i*.5,'plates':(
-            [{'text':'川A8BX43','confidence':.99,'box_normalized':[.44,.58,.48,.61]}]
-            + ([{'text':'冀A8BX43','confidence':.995,'box_normalized':[.44,.58,.48,.61]}] if i<5 else [])
+            [{'text':'川A10001','confidence':.99,'box_normalized':[.44,.58,.48,.61]}]
+            + ([{'text':'冀A10001','confidence':.995,'box_normalized':[.44,.58,.48,.61]}] if i<5 else [])
         )} for i in range(7)]
         ranked=consensus(split)
-        self.assertEqual(ranked[0]['text'],'川A8BX43')
+        self.assertEqual(ranked[0]['text'],'川A10001')
         self.assertEqual(ranked[0]['hits'],12)
-        self.assertTrue(all(p['text']!='冀A8BX43' for p in ranked))
+        self.assertTrue(all(p['text']!='冀A10001' for p in ranked))
         slide=[{'time_seconds':i*.5,'vehicles':[{'track_id':7,'score':.9,
             'box_normalized':[.52-i*.03,.45,.66-i*.03,.62]}]} for i in range(6)]
         self.assertEqual(lane_changes(slide)[0]['type'],'LATERAL_MOVEMENT')
@@ -385,10 +387,10 @@ class BackendTest(unittest.TestCase):
             both.append({'time_seconds':i*.5,'signal_observed':'RED','vehicles':[
                 {'track_id':1,'score':.9,'box_normalized':[.4,.4,.6,.5+i*.04]},
                 {'track_id':2,'score':.9,'box_normalized':[.22,.4,.38,.52+i*.04]}],
-                'plates':[{'text':'川A8BX43','track_id':1,'box_normalized':[.46,.5,.52,.54]},
+                'plates':[{'text':'川A10001','track_id':1,'box_normalized':[.46,.5,.52,.54]},
                           {'text':'川B12345','track_id':2,'box_normalized':[.28,.48,.34,.52]}]})
-        self.assertEqual({item['plate'] for item in red_approaches(both,['川A8BX43','川B12345'])},
-                         {'川A8BX43','川B12345'})
+        self.assertEqual({item['plate'] for item in red_approaches(both,['川A10001','川B12345'])},
+                         {'川A10001','川B12345'})
         laterals=[{'type':'SOLID_LINE','track_id':2,'time_seconds':5.0},
                   {'type':'SOLID_LINE','track_id':3,'time_seconds':5.5}]
         red_frames=[{'time_seconds':t,'signal_observed':'RED'} for t in (4.5,5.0,5.5)]
@@ -399,10 +401,10 @@ class BackendTest(unittest.TestCase):
                  for t in (2.0,3.0,4.0,4.5,5.0,5.5,6.0)]
         self.assertTrue(turned_from_green(turning,4,5.0))
         self.assertEqual(red_during_laterals(turning,[{'type':'SOLID_LINE','track_id':4,'time_seconds':5.0}]),[])
-        plated={'plate':'川A8BX43','type':'RED_LIGHT','track_id':1,'time_seconds':12}
+        plated={'plate':'川A10001','type':'RED_LIGHT','track_id':1,'time_seconds':12}
         red=[{'time_seconds':t,'signal_observed':'RED',
               'vehicles':[{'track_id':1,'box_normalized':[.4,.4,.6,.5]}],
-              'plates':[{'text':'川A8BX43','track_id':1}]} for t in (8,9,10,11,12)]
+              'plates':[{'text':'川A10001','track_id':1}]} for t in (8,9,10,11,12)]
         self.assertEqual(clip_windows([{**plated,'time_seconds':10},{**plated,'time_seconds':12,'type':'SOLID_LINE'}],20),[])
         self.assertEqual(clip_windows([{'time_seconds':78,'clip_until':111}],180),[])
         span=clip_windows([plated],20,red)
@@ -411,7 +413,7 @@ class BackendTest(unittest.TestCase):
         self.assertAlmostEqual(span[0]['end'],12.5,places=1)
         cluster=lambda t0: [{'time_seconds':t0+i,'signal_observed':'RED',
                              'vehicles':[{'track_id':1,'box_normalized':[.4,.4,.6,.5]}],
-                             'plates':[{'text':'川A8BX43','track_id':1}]} for i in range(3)]
+                             'plates':[{'text':'川A10001','track_id':1}]} for i in range(3)]
         split=clip_windows([{**plated,'time_seconds':78},{**plated,'time_seconds':103,'type':'SOLID_LINE'}],180,
                            cluster(76)+cluster(102))
         self.assertEqual([(round(w['start'],1),round(w['end'],1)) for w in split],[(75.5,78.5),(101.5,104.5)])
@@ -419,11 +421,11 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(clip_windows([{**plated,'time_seconds':40}],80,red),[])
         self.assertEqual([v['plate'] for v in bind_plates(
             [{'type':'SOLID_LINE','track_id':1},{'type':'RED_LIGHT','track_id':2,'plate':'京AM0H772'}],
-            [{'plates':[{'text':'冀A8BX43','track_id':1}]}, {'plates':[{'text':'川A8BX43','track_id':1}]}],
-            [{'text':'川A8BX43','stable':True}])], ['川A8BX43'])
-        self.assertEqual(bind_plates([{'type':'RED_LIGHT','track_id':2,'plate':'川A8BX43'}],
-            [{'plates':[{'text':'川A8BX43','track_id':1}]} for _ in range(3)],
-            [{'text':'川A8BX43','stable':True}]), [])
+            [{'plates':[{'text':'冀A10001','track_id':1}]}, {'plates':[{'text':'川A10001','track_id':1}]}],
+            [{'text':'川A10001','stable':True}])], ['川A10001'])
+        self.assertEqual(bind_plates([{'type':'RED_LIGHT','track_id':2,'plate':'川A10001'}],
+            [{'plates':[{'text':'川A10001','track_id':1}]} for _ in range(3)],
+            [{'text':'川A10001','stable':True}]), [])
         self.assertEqual(bind_plates([{'type':'SOLID_LINE','track_id':9,'plate':'京AM0H772'}],
             [{'plates':[{'text':'京AM0H772','track_id':9}]}],
             [{'text':'京AM0H772','stable':False}]), [])
@@ -664,14 +666,14 @@ class BackendTest(unittest.TestCase):
         self.assertEqual([x["track_id"] for x in first], [x["track_id"] for x in second])
         self.assertEqual(len({x["track_id"] for x in second}), 2)
         tracker = Tracker()
-        left={'label':'car','score':.9,'box':[200,100,300,200],'plate':'川A8BX43'}
+        left={'label':'car','score':.9,'box':[200,100,300,200],'plate':'川A10001'}
         right={'label':'car','score':.9,'box':[400,100,500,200],'plate':'冀AEV8180'}
         ids={row['plate']:row['track_id'] for row in tracker.update([dict(left),dict(right)],0)}
         left['box']=[40,100,140,200]
         self.assertEqual({row['plate']:row['track_id'] for row in tracker.update([dict(left),dict(right)],1)}, ids)
         left['box']=[20,100,120,200]
         self.assertEqual({row['plate']:row['track_id'] for row in tracker.update([
-            {'label':'car','score':.9,'box':list(left['box']),'plate':'川A8BX43'},
+            {'label':'car','score':.9,'box':list(left['box']),'plate':'川A10001'},
             {'label':'car','score':.9,'box':list(right['box']),'plate':'冀AEV8180'}],2)}, ids)
         self.assertEqual(len(set(ids.values())), 2)
         tracker = Tracker()

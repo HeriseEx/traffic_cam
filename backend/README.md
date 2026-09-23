@@ -26,11 +26,37 @@ docker compose up -d --build --wait
 
 1. 左侧按状态、提交/复核状态和车牌或事件编号查找记录；选择后预览视频、检测框和车牌证据，点击证据卡定位视频时间。
 2. “AI 原始判断”和“当前生效结果”分别显示自动结果和人工覆盖。完成分析后可在“人工干预”填写原因并保存，手机自动接收变化；无需逐条人工确认后才能处理。
-3. “模型与参数”可切换 YOLOX-Tiny / S / M / L，调整车辆阈值、采样帧率、车牌阈值、一致帧数、CPU 线程，并开关车牌识别和违法候选规则。
+3. “模型与参数”可切换 YOLOX-Tiny / S / M / L，调整车辆阈值、采样帧率、车牌阈值、一致帧数、CPU 线程，并开关车牌识别和违法候选规则。每次保存必须输入独立的管理密码；普通客户端登录、配对码和 API 令牌均不能绕过。
 4. 配置对新任务生效；历史任务保留当时的配置。展开“道路标定”，可以对未提交记录按当前配置重新分析，旧结果存入审计历史。
 5. 页面每 4 秒刷新；正在编辑的表单不会被新结果覆盖。并发修改会返回冲突并要求加载最新版本。
 
 预览是单独的 H.264 浏览器兼容副本，原始视频及 SHA-256 不变；识别框只在页面叠加，不写进原片。支持视频范围请求和拖动播放。
+
+## 设置管理密码
+
+默认没有预设密码，未配置时设置接口只读，采集、上传、预览和分析继续使用已有参数。在服务器交互终端初始化或重置密码：
+
+```sh
+# 已启动的 Docker 部署（命令在 api 容器内操作现有 /data）
+docker compose exec api python settings_password.py set
+# 本机 Python 部署：在 backend 目录运行
+python settings_password.py set
+# 非默认数据目录
+python settings_password.py set --data-dir /path/to/traffic-data
+```
+
+两次输入 15–128 个字符的长口令，终端不回显；不通过命令行参数、环境变量或网页传递初始密码。密码保存在现有 `data/tasks.sqlite3` 中，只存随机盐与 scrypt 哈希（N=32768、r=8、p=3，采用 [OWASP 密码存储建议](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) 的参数组合）。无需重启，重置即刻生效；网页每次保存都重新验证，不缓存“已解锁”权限。数据库迁移/备份仍需保护文件访问权限。
+
+网页保存走 HTTPS，密码仅在本次请求体中提交，不写入 URL、localStorage、业务配置或返回结果。生产环境沿用 Nginx Proxy Manager 的 HTTPS 域名；本机联调可使用 loopback HTTP。
+
+防猜测由服务器执行：同一个管理密码共用 5 次尝试预算，15 分钟窗口内累计到上限后锁定 15 分钟；成功保存清零。计数在 SQLite 事务中先占用，再做慢哈希验证，并发 API 进程、新设备、新会话、伪造 IP 和服务重启均不能清零。锁定时返回 `429` 和 `Retry-After`，网页显示倒计时。它限制在线猜测，不代表弱密码绝对无法猜中；使用独立长口令。主动攻击也可能触发临时锁定，服务器管理员可恢复：
+
+```sh
+docker compose exec api python settings_password.py unlock
+# 本机使用 python settings_password.py unlock [--data-dir 数据目录]
+```
+
+管理密码初始化、重置和解锁仅提供服务器命令，不开放匿名网页接口。忘记密码执行 `set` 重置即可。此密码保护全局“模型与参数”的修改；视频采集、结果查询和单条任务人工复核仍沿用原权限。
 
 ## 安卓连接
 
@@ -49,7 +75,7 @@ adb reverse tcp:61616 tcp:61616
 
 HyperLPR3 检测车牌、透视矫正、CTC 识别大陆车牌，按置信度和格式过滤。视频默认 2 fps，至少 2 个采样帧的文字一致才成为主车牌；单帧候选仍可在证据卡查看。原始分辨率用于 OCR 裁剪，不能先缩到 720p：实测缩小后可能漏字符且置信度仍很高。
 
-1080p 整帧缩到 640 检测会直接漏掉远处小车牌（行车记录仪画面前车车牌约 70px，缩后仅 23px）。识别现在是整帧一遍 + 大图 2×2 重叠分块，检出的小车牌再按原图邻域放大重读；同一块车牌的多个读数按“合法字符数多者优先、再比置信度”合并——掉字是已确认的失败模式（苏ED51712 曾被读成苏ED5112），多字未见。单帧省份汉字在小车牌上仍可能读错（实测 川 误读为 冀），多帧一致性才是可信度依据：夜间行车记录仪两段 20 秒 1080p 片段实测（`validation/dashcam_clips_check.py`），主车牌分别为 绿牌 川AA91307（20/40 帧，conf 0.9984）和 蓝牌 川A8BX43（25/40 帧，conf 0.9998），省份单帧误读均为少数票；注意同一物理车牌的误读文字命中 ≥2 帧时也会标记 stable，主车牌以命中数排序为准。大角度侧向车牌（左前车 B39131）仍会全程漏检。
+1080p 整帧缩到 640 检测会直接漏掉远处小车牌（行车记录仪画面前车车牌约 70px，缩后仅 23px）。识别现在是整帧一遍 + 大图 2×2 重叠分块，检出的小车牌再按原图邻域放大重读；同一块车牌的多个读数按“合法字符数多者优先、再比置信度”合并——掉字是已确认的失败模式（公开样例图上的完整车牌曾被读成少一位），多字未见。单帧省份汉字在小车牌上仍可能读错，多帧一致性才是可信度依据。夜间行车记录仪片段只在本地 `test/` 和 `validation/` 核对，车牌号不写入仓库；同一物理车牌的误读文字命中 ≥2 帧时也会标记 stable，主车牌以命中数排序为准。大角度侧向车牌仍会全程漏检。
 
 多帧一致只是可信度提示，不保证正确。遮挡、远距离、小车牌、夜间、运动模糊仍需真实道路样本评估；同一静态图片重复多帧不代表运动场景验证。一个视频可能包含多个车牌，页面保留全部候选。
 
@@ -78,7 +104,7 @@ HyperLPR3 检测车牌、透视矫正、CTC 识别大陆车牌，按置信度和
 | `POST /v1/tasks/{id}/reanalyze` | 使用配置/道路标定重跑；保留旧结果审计 |
 | `GET /v1/tasks/{id}/audit` | 修改历史 |
 | `GET /v1/overview` | 状态统计、worker 心跳 |
-| `GET/PUT /v1/settings` | 模型目录、运行参数；PUT 需要 expected_revision |
+| `GET/PUT /v1/settings` | 模型目录、运行参数；GET 含 settings_security 状态；PUT 必须携带 expected_revision、config 和 password |
 | `POST /v1/recognize-frame` | 不落盘的 JPEG；返回车牌（若开启）、`lights`、`signal_observed`；最大 2 MiB / 4K |
 | `POST /v1/tasks/{id}/retry` | ERROR 任务重试，最多 3 次 |
 | `DELETE /v1/tasks/{id}` | 清理视频，记录保留，处理中返回 409 |
@@ -102,6 +128,7 @@ HyperLPR3 检测车牌、透视矫正、CTC 识别大陆车牌，按置信度和
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest -v test_backend.py
+.\.venv\Scripts\python.exe -m unittest -v test_settings_security.py
 .\.venv\Scripts\python.exe plate_smoke.py
 # 可选：重建容器后的排队恢复验证
 .\.venv\Scripts\python.exe smoke.py --restart

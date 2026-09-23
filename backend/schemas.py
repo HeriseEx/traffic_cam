@@ -1,5 +1,5 @@
 from typing import Annotated, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 Unit = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Point = tuple[Unit, Unit]
@@ -103,6 +103,7 @@ class SettingsUpdate(BaseModel):
     model_config = ConfigDict(extra='forbid')
     expected_revision: int = Field(ge=1)
     config: AnalysisConfig
+    password: SecretStr = Field(default=SecretStr(''), max_length=128, repr=False)
 
 
 class Submission(BaseModel):

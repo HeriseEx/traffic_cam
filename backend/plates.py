@@ -211,7 +211,7 @@ class PlateReader:
 
 
 def consensus(frames, min_hits=2):
-    """同一辆车的省份误读（川A8BX43 / 冀A8BX43）按后缀合并，票多的省份胜出。"""
+    """同一辆车的省份误读按后缀合并，票多的省份胜出。"""
     grouped={}
     for frame in frames:
         for text in {p['text'] for p in frame.get('plates',[])}:

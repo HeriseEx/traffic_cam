@@ -1,0 +1,4 @@
+[submodule "traffic_cam_android"]
+	path = traffic_cam_android
+	url = https://github.com/HeriseEx/traffic_cam_android.git
+	branch = main

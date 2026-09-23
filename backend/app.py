@@ -16,6 +16,8 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -27,6 +29,7 @@ from model_catalog import catalog, plate_catalog, plate_installed, model_directo
 from plates import PlateReader
 from signals import detect_lights, observe
 from hello import ok as hello_ok
+from settings_security import SettingsPassword, PasswordError
 
 
 class Event(BaseModel):
@@ -65,6 +68,7 @@ def peer_ip(request: Request):
 def create_app(settings=None):
     settings = settings or Settings()
     store = Store(settings)
+    settings_password = SettingsPassword(store)
     plate_lock = threading.Lock()
     live_reader = None
     live_detector = None
@@ -109,6 +113,18 @@ def create_app(settings=None):
     @app.exception_handler(Conflict)
     async def conflict(request,error):
         return JSONResponse({'detail':str(error)},status_code=409)
+
+    @app.exception_handler(PasswordError)
+    async def password_error(request, error):
+        return JSONResponse({'detail': str(error), 'retry_after': error.retry_after}, status_code=error.status,
+                            headers={'Retry-After': str(error.retry_after)} if error.retry_after else {})
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, error):
+        if request.url.path == '/v1/settings':
+            # Validation errors must never echo a submitted password or its containing request body.
+            return JSONResponse({'detail': '设置请求格式不正确，请检查参数后重试。'}, status_code=422)
+        return await request_validation_exception_handler(request, error)
 
     @app.middleware('http')
     async def response_headers(request,call_next):
@@ -231,7 +247,8 @@ def create_app(settings=None):
     def configuration():
         raw=store.configuration()
         config=AnalysisConfig.model_validate(raw['config']).model_dump()
-        return {**raw,'config':config,'models':catalog(settings),'plate_models':plate_catalog(settings)}
+        return {**raw,'config':config,'models':catalog(settings),'plate_models':plate_catalog(settings),
+                'settings_security': settings_password.status()}
 
     def check_models(config):
         if not next(m for m in catalog(settings) if m['id']==config.vehicle_model)['installed']:
@@ -243,8 +260,9 @@ def create_app(settings=None):
 
     @app.put('/v1/settings',dependencies=[Depends(authorized)])
     def configure(body:SettingsUpdate):
+        password_revision = settings_password.verify(body.password.get_secret_value())
         check_models(body.config)
-        return store.configure(body.expected_revision,body.config.model_dump())
+        return store.configure(body.expected_revision,body.config.model_dump(),password_revision=password_revision)
 
     @app.post('/v1/recognize-frame',dependencies=[Depends(authorized)])
     async def recognize_frame(request:Request):
