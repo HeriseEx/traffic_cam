@@ -2,3 +2,11 @@
 .plate-card.ranked{background:var(--plate-bg,#fff);color:var(--plate-fg,#173042);border-color:color-mix(in srgb,var(--plate-fg,#173042) 18%,transparent)}
 .plate-card.ranked:hover{background:var(--plate-bg,#fff);filter:brightness(.96)}
 .plate-card.ranked small{color:inherit;opacity:.82}
+.user-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}
+#usersDialog h3{margin:18px 0 8px}#inviteToken{word-break:break-all}#joinForm{max-width:420px}
+.parking-photos{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.parking-photos figure{margin:0;background:#10232d;border-radius:10px;overflow:hidden}
+.parking-photos img{width:100%;max-height:420px;object-fit:contain;background:#0c1a22;display:block}
+.parking-photos figcaption{color:#d7ebe6;padding:8px 10px}
+.parking-meta{margin:12px 0 4px}
+@media(max-width:760px){.parking-photos{grid-template-columns:1fr}}

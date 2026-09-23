@@ -3,13 +3,15 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 Unit = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Point = tuple[Unit, Unit]
-Violation = Literal['UNKNOWN', 'NONE', 'SOLID_LINE', 'WRONG_WAY', 'RED_LIGHT', 'RESTRICTED_LANE', 'LATERAL_MOVEMENT']
+Violation = Literal['UNKNOWN', 'NONE', 'SOLID_LINE', 'WRONG_WAY', 'RED_LIGHT', 'RESTRICTED_LANE', 'LATERAL_MOVEMENT',
+    'EMERGENCY_LANE', 'NO_SIGNAL', 'OVERTAKE', 'DANGEROUS_CHANGE', 'CUT_IN', 'ILLEGAL_PARKING']
 
 
 class MobileIncident(BaseModel):
     model_config = ConfigDict(extra='forbid')
     track_id: int = Field(ge=1)
-    kind: Literal['RED_LIGHT', 'LATERAL_MOVEMENT']
+    kind: Literal['RED_LIGHT', 'LATERAL_MOVEMENT', 'SOLID_LINE', 'WRONG_WAY', 'RESTRICTED_LANE',
+        'EMERGENCY_LANE', 'NO_SIGNAL', 'OVERTAKE', 'DANGEROUS_CHANGE', 'CUT_IN', 'ILLEGAL_PARKING']
     start_ms: int = Field(ge=0, le=89000)
     end_ms: int = Field(ge=0, le=89000)
     plate: str | None = Field(default=None, max_length=16, pattern=r'^[\u4e00-\u9fffA-Z0-9·-]*$')
@@ -46,11 +48,14 @@ class Scene(BaseModel):
     fixed_camera: bool = False
     solid_line: tuple[Point, Point] | None = None
     allowed_direction: tuple[Point, Point] | None = None
+    stop_line: tuple[Point, Point] | None = None
+    lane_line: tuple[Point, Point] | None = None
+    emergency_edge: tuple[Point, Point] | None = None
     road_roi: tuple[Unit, Unit, Unit, Unit] = (0, 0, 1, 1)
 
     @model_validator(mode='after')
     def geometry(self):
-        for segment in (self.solid_line, self.allowed_direction):
+        for segment in (self.solid_line, self.allowed_direction, self.stop_line, self.lane_line, self.emergency_edge):
             if segment and sum((a-b)**2 for a, b in zip(*segment)) < .0025:
                 raise ValueError('标定线段太短')
         x1, y1, x2, y2 = self.road_roi

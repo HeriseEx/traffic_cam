@@ -5,13 +5,23 @@ import threading
 import uuid
 
 from config import Settings
-from inference import Detector, InvalidVideo, analyze, extract_clips
+from inference import Detector, InvalidVideo, analyze, extract_clips, retain_stills
 from store import Store
 from schemas import AnalysisConfig
 from plates import PlateReader
+from speech import attach_speech
 from model_catalog import model_directory
 
 log = logging.getLogger("traffic-worker")
+
+
+def unplated_rejection(result, trigger, plate_enabled, plated):
+    """Automatic clips without a confirmed plate are rejected. Manual and voice clips stay."""
+    if plate_enabled and not plated and trigger not in ('manual', 'voice'):
+        result.update(violations=[], clips=[], decision='REJECTED', reason='PLATE_UNCONFIRMED',
+                      violation_type=None, plate=None, rule_assessment='PLATE_UNCONFIRMED')
+        return True
+    return False
 
 
 def process_one(store, detector, owner, models=None):
@@ -37,14 +47,24 @@ def process_one(store, detector, owner, models=None):
         with path.open("rb") as stream:
             if hashlib.file_digest(stream, "sha256").hexdigest() != task["sha256"]:
                 raise InvalidVideo("Stored video checksum mismatch")
+        meta = task.get("metadata") or {}
+        if meta.get("candidate_type") == "ILLEGAL_PARKING":
+            plates = [item.get("plate") for item in ((meta.get("capture") or {}).get("incidents") or [])
+                      if item.get("plate_confirmed") and item.get("plate")]
+            store.finish(task_id, owner, "ANALYZED", {
+                "decision": "CANDIDATE", "submission_allowed": False,
+                "violation_type": "ILLEGAL_PARKING", "plate": plates[0] if plates else None,
+                "reason": "PARKING_PHOTOS", "vehicle_presence": True,
+            })
+            return True
         def heartbeat():
             store.worker_heartbeat('处理中 '+task_id)
             return store.heartbeat(task_id,owner)
         result = analyze(path, detector, store.settings, heartbeat,config,plate_reader,task.get('scene'))
+        result = attach_speech(store, task, result)
         plated=any(p.get('stable') and p.get('text') for p in result.get('plates') or [])
-        if config.plate_enabled and not plated:
-            result.update(violations=[],clips=[],decision='REJECTED',reason='PLATE_UNCONFIRMED',
-                          violation_type=None,plate=None,rule_assessment='PLATE_UNCONFIRMED')
+        spoken = meta.get('trigger') in ('manual', 'voice')
+        if unplated_rejection(result, meta.get('trigger'), config.plate_enabled, plated):
             status='REJECTED'
         else:
             if result.get('violations'):
@@ -69,7 +89,7 @@ def process_one(store, detector, owner, models=None):
                     result['clips']=[]
                     result['decision']='UNKNOWN'
                     result['violation_type']=None
-            status = "ANALYZED" if result["vehicle_presence"] else "REJECTED"
+            status = "ANALYZED" if result["vehicle_presence"] or spoken else "REJECTED"
         store.finish(task_id, owner, status, result)
         log.info("task=%s status=%s elapsed_ms=%s", task_id, status, result["elapsed_ms"])
     except InvalidVideo as error:
@@ -95,7 +115,16 @@ def main():
     owner = str(uuid.uuid4())
     log.info("Worker ready: automatic analysis / configurable CPU models")
     while not stop.is_set():
-        store.cleanup()
+        def keep(task_id, models=models):
+            reader = models.get('plate')
+            if reader is None:
+                try:
+                    reader = PlateReader(model_directory(store.settings) / 'plate', 2, 'hyperlpr3')
+                    models['plate'] = reader
+                except Exception:
+                    reader = None
+            retain_stills(store, task_id, reader)
+        store.cleanup(keep)
         store.worker_heartbeat('等待任务')
         if not process_one(store, None, owner, models):
             stop.wait(2)

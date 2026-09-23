@@ -9,6 +9,7 @@ from contextlib import contextmanager
 
 from config import Settings
 from schemas import AnalysisConfig
+from settings_security import hash_password, password_matches
 
 
 class Conflict(Exception):
@@ -58,6 +59,18 @@ class Store:
                     window_started REAL NOT NULL DEFAULT 0
                 );
                 INSERT OR IGNORE INTO settings_security(id) VALUES(1);
+                CREATE TABLE IF NOT EXISTS accounts (
+                    user_id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL, role TEXT NOT NULL,
+                    disabled INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+                    window_started REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS account_sessions (
+                    session_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS invites (
+                    token_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL, used_at REAL);
+                CREATE TABLE IF NOT EXISTS console_policy (
+                    id INTEGER PRIMARY KEY CHECK(id=1), retention_days INTEGER NOT NULL DEFAULT 30);
+                INSERT OR IGNORE INTO console_policy(id,retention_days) VALUES(1,30);
             """)
             # Migrate existing credentials once; browser tabs may each hold a valid session for one device.
             db.execute('INSERT OR IGNORE INTO client_sessions SELECT session_hash,client_id,? FROM clients WHERE session_hash<>?',
@@ -66,7 +79,8 @@ class Store:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(tasks)')}
             for name, declaration in {'revision': 'INTEGER NOT NULL DEFAULT 1',
                     'analysis_config': 'TEXT', 'scene': 'TEXT', 'review': 'TEXT',
-                    'submission_status': "TEXT NOT NULL DEFAULT 'NOT_SUBMITTED'", 'receipt': 'TEXT'}.items():
+                    'submission_status': "TEXT NOT NULL DEFAULT 'NOT_SUBMITTED'", 'receipt': 'TEXT',
+                    'uploader': "TEXT NOT NULL DEFAULT ''"}.items():
                 if name not in columns:
                     db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {declaration}')
             db.execute('INSERT OR IGNORE INTO runtime_settings VALUES(1,1,?)',
@@ -117,7 +131,7 @@ class Store:
         with self.connection() as db:
             return self.decode(db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
-    def list(self, limit=30, offset=0, status='', review='', query=''):
+    def list(self, limit=30, offset=0, status='', review='', query='', violation='', uploader=''):
         with self.connection() as db:
             filters, args = ['1=1'], []
             if status:
@@ -131,6 +145,14 @@ class Store:
             if query:
                 filters.append('(event_id LIKE ? OR result LIKE ? OR review LIKE ?)')
                 args.extend(['%'+query+'%']*3)
+            if violation:
+                filters.append("(json_extract(metadata,'$.candidate_type')=? OR json_extract(result,'$.violation_type')=?)")
+                args.extend([violation, violation])
+            if uploader:
+                filters.append('uploader=?')
+                args.append(uploader)
+            filters.append("""NOT (json_extract(metadata,'$.trigger')='automatic'
+                AND IFNULL(json_extract(result,'$.reason'),'')='PLATE_UNCONFIRMED')""")
             return [self.decode(row) for row in db.execute(
                 'SELECT * FROM tasks WHERE '+ ' AND '.join(filters) + ' ORDER BY created_at DESC LIMIT ? OFFSET ?',
                 (*args, limit, offset))]
@@ -140,11 +162,12 @@ class Store:
         db.execute('UPDATE tasks SET revision=revision+1,updated_at=? WHERE task_id=?', (time.time(), task_id))
         db.execute('INSERT INTO changes(task_id,created_at) VALUES(?,?)', (task_id,time.time()))
 
-    def changes(self, after, limit=50):
+    def changes(self, after, limit=50, uploader=''):
         with self.connection() as db:
             rows = db.execute('SELECT id,task_id FROM changes WHERE id>? ORDER BY id LIMIT ?', (after,limit)).fetchall()
             tasks = [self.decode(db.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone())
                      for task_id in dict.fromkeys(row['task_id'] for row in rows)]
+            tasks = [task for task in tasks if task and (not uploader or task.get('uploader') == uploader)]
             # Mobile catch-up needs judgments, not every detection box from every video.
             # Full evidence remains available through GET /v1/tasks/{task_id}.
             for task in tasks:
@@ -206,7 +229,7 @@ class Store:
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.editable(db,task_id,expected)
-            if row['status'] in ('QUEUED','PROCESSING','EXPIRED') or row['expires_at'] <= time.time():
+            if row['status'] in ('QUEUED','PROCESSING','EXPIRED','NEEDS_CROP') or row['expires_at'] <= time.time():
                 raise Conflict('任务正在处理或视频已过期')
             if not self.video(task_id).exists():
                 raise Conflict('原始视频不存在')
@@ -233,15 +256,20 @@ class Store:
         with self.connection() as db:
             db.execute('INSERT OR REPLACE INTO worker_state VALUES(1,?,?)',(time.time(),message))
 
-    def overview(self):
+    def overview(self, uploader=''):
         with self.connection() as db:
-            counts = dict(db.execute('SELECT status,COUNT(*) FROM tasks GROUP BY status').fetchall())
+            where, args = (' WHERE uploader=?', [uploader]) if uploader else ('', [])
+            counts = dict(db.execute(f'SELECT status,COUNT(*) FROM tasks{where} GROUP BY status', args).fetchall())
             row = db.execute('SELECT * FROM worker_state WHERE id=1').fetchone()
-            return {'counts':counts,'total':sum(counts.values()),
-                    'intervened':db.execute('SELECT COUNT(*) FROM tasks WHERE review IS NOT NULL').fetchone()[0],
-                    'worker':dict(row) if row else None,
-                    'client_count':db.execute('SELECT COUNT(*) FROM clients').fetchone()[0],
-                    'clients':[dict(item) for item in db.execute(
+            queue = db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status IN ('QUEUED','PROCESSING','NEEDS_CROP')").fetchone()[0]
+            return {'counts': counts, 'total': sum(counts.values()), 'queue': queue,
+                    'intervened': db.execute(f'SELECT COUNT(*) FROM tasks{where} AND review IS NOT NULL'
+                                             if uploader else
+                                             'SELECT COUNT(*) FROM tasks WHERE review IS NOT NULL', args).fetchone()[0],
+                    'worker': dict(row) if row else None,
+                    'client_count': db.execute('SELECT COUNT(*) FROM clients').fetchone()[0],
+                    'clients': [dict(item) for item in db.execute(
                         'SELECT client_id,platform,model,app_version,ip,created_at,last_seen FROM clients ORDER BY last_seen DESC LIMIT 50')]}
 
     def video(self, task_id):
@@ -250,6 +278,9 @@ class Store:
 
     def clips_dir(self, task_id):
         return self.settings.data / "clips" / str(uuid.UUID(task_id))
+
+    def audio_file(self, task_id):
+        return self.settings.data / "audio" / f"{uuid.UUID(task_id)}.wav"
 
     def archive_all(self):
         """Hard-clear records and files so the console is empty. Processing tasks block."""
@@ -266,6 +297,7 @@ class Store:
             db.execute('DELETE FROM tasks')
         for task_id in ids:
             self.video(task_id).unlink(missing_ok=True)
+            self.audio_file(task_id).unlink(missing_ok=True)
             (self.settings.data / 'previews' / f'{task_id}.mp4').unlink(missing_ok=True)
             folder = self.settings.data / 'clips' / task_id
             if folder.is_dir():
@@ -339,7 +371,7 @@ class Store:
                            (time.time(), row['client_id']))
             return True
 
-    def add(self, metadata, sha256, size, temporary):
+    def add(self, metadata, sha256, size, temporary, uploader=''):
         encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
         task_id = str(uuid.uuid4())
         now = time.time()
@@ -347,18 +379,20 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM tasks WHERE event_id=?", (metadata["event_id"],)).fetchone()
             if existing:
-                previous = {'trigger':'import','trigger_text':'','scene':None,'capture':None,**json.loads(existing['metadata'])}
+                previous = {'trigger':'import','trigger_text':'','scene':None,'capture':None,
+                    'location':None,'location_note':'',**json.loads(existing['metadata'])}
                 if existing["sha256"] != sha256 or previous != metadata:
                     raise Conflict("event_id already exists with different content or metadata")
                 return self.decode(existing), False
             destination = self.video(task_id)
             temporary.replace(destination)
             try:
+                status = 'NEEDS_CROP' if size > self.settings.evidence_bytes else 'QUEUED'
                 db.execute("""INSERT INTO tasks
-                    (task_id,event_id,metadata,sha256,bytes,status,created_at,updated_at,expires_at)
-                    VALUES (?,?,?,?,?,'QUEUED',?,?,?)""",
-                    (task_id, metadata["event_id"], encoded, sha256, size, now, now,
-                     now + self.settings.retention_hours * 3600))
+                    (task_id,event_id,metadata,sha256,bytes,status,created_at,updated_at,expires_at,uploader)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (task_id, metadata["event_id"], encoded, sha256, size, status, now, now,
+                     now + self.retention_days() * 86400, uploader[:40]))
                 config = db.execute('SELECT config FROM runtime_settings WHERE id=1').fetchone()[0]
                 db.execute('UPDATE tasks SET analysis_config=?,scene=? WHERE task_id=?',
                     (config,json.dumps(metadata.get('scene')),task_id))
@@ -369,6 +403,159 @@ class Store:
                 destination.unlink(missing_ok=True)
                 raise
         return self.get(task_id), True
+
+    def retention_days(self):
+        with self.connection() as db:
+            row = db.execute('SELECT retention_days FROM console_policy WHERE id=1').fetchone()
+        return int(row['retention_days']) if row else 30
+
+    def set_retention_days(self, days):
+        if not 1 <= int(days) <= 365:
+            raise Conflict('视频保留天数必须在 1–365')
+        with self.connection() as db:
+            db.execute('UPDATE console_policy SET retention_days=? WHERE id=1', (int(days),))
+
+    def needs_admin(self):
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone() is None
+
+    def _open_account_session(self, db, user_id):
+        raw = secrets.token_urlsafe(32)
+        db.execute('INSERT INTO account_sessions(session_hash,user_id,expires_at) VALUES(?,?,?)',
+                   (hashlib.sha256(raw.encode()).hexdigest(), user_id, time.time() + 30 * 86400))
+        return raw
+
+    def create_admin(self, username, password):
+        self._check_username(username)
+        if not self.needs_admin():
+            raise Conflict('管理员已经存在')
+        user_id = str(uuid.uuid4())
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone():
+                raise Conflict('管理员已经存在')
+            db.execute("""INSERT INTO accounts(user_id,username,password_hash,role,created_at)
+                VALUES(?,?,?,'admin',?)""", (user_id, username, hash_password(password, 8), time.time()))
+            return self._open_account_session(db, user_id)
+
+    def login_account(self, username, password):
+        now = time.time()
+        failure = None
+        opened = None
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM accounts WHERE username=?', (username,)).fetchone()
+            if not row or row['disabled']:
+                failure = '账户已停用' if row and row['disabled'] else '账号或密码不正确'
+            else:
+                started, attempts = row['window_started'], row['attempts']
+                if now >= started + 15 * 60:
+                    attempts, started = 0, now
+                if attempts >= 5:
+                    failure = '密码尝试过于频繁，请稍后重试'
+                elif not password_matches(password, row['password_hash']):
+                    db.execute('UPDATE accounts SET attempts=?,window_started=? WHERE user_id=?',
+                               (attempts + 1, started, row['user_id']))
+                    failure = '账号或密码不正确'
+                else:
+                    db.execute('UPDATE accounts SET attempts=0,window_started=0 WHERE user_id=?', (row['user_id'],))
+                    opened = (self._open_account_session(db, row['user_id']), row['role'])
+        if failure:
+            raise Conflict(failure)
+        return opened
+
+    def user_by_token(self, raw):
+        if not raw or len(raw) > 80:
+            return None
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        with self.connection() as db:
+            row = db.execute("""SELECT a.* FROM account_sessions s JOIN accounts a ON a.user_id=s.user_id
+                WHERE s.session_hash=? AND s.expires_at>?""", (digest, time.time())).fetchone()
+        if not row or row['disabled']:
+            return None
+        return {'user_id': row['user_id'], 'username': row['username'], 'role': row['role']}
+
+    def revoke_account(self, raw):
+        if not raw:
+            return
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        with self.connection() as db:
+            db.execute('DELETE FROM account_sessions WHERE session_hash=?', (digest,))
+
+    def issue_invite(self):
+        raw = secrets.token_urlsafe(24)
+        with self.connection() as db:
+            db.execute('INSERT INTO invites(token_hash,expires_at) VALUES(?,?)',
+                       (hashlib.sha256(raw.encode()).hexdigest(), time.time() + 30 * 60))
+        return raw
+
+    def register_account(self, token, username, password):
+        self._check_username(username)
+        digest = hashlib.sha256((token or '').encode()).hexdigest()
+        user_id = str(uuid.uuid4())
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM invites WHERE token_hash=?', (digest,)).fetchone()
+            if not row or row['used_at'] or row['expires_at'] <= time.time():
+                raise Conflict('邀请已失效')
+            if db.execute('SELECT 1 FROM accounts WHERE username=?', (username,)).fetchone():
+                raise Conflict('用户名已存在')
+            db.execute('UPDATE invites SET used_at=? WHERE token_hash=?', (time.time(), digest))
+            db.execute("""INSERT INTO accounts(user_id,username,password_hash,role,created_at)
+                VALUES(?,?,?,'user',?)""", (user_id, username, hash_password(password, 8), time.time()))
+            return self._open_account_session(db, user_id)
+
+    def disable_account(self, username):
+        with self.connection() as db:
+            row = db.execute('SELECT * FROM accounts WHERE username=?', (username,)).fetchone()
+            if not row:
+                raise Conflict('用户不存在')
+            if row['role'] == 'admin':
+                raise Conflict('不能停用管理员')
+            db.execute('UPDATE accounts SET disabled=1 WHERE user_id=?', (row['user_id'],))
+            db.execute('DELETE FROM account_sessions WHERE user_id=?', (row['user_id'],))
+
+    def accounts(self):
+        with self.connection() as db:
+            return [{'username': row['username'], 'role': row['role'], 'disabled': bool(row['disabled'])}
+                    for row in db.execute('SELECT username,role,disabled FROM accounts ORDER BY created_at')]
+
+    @staticmethod
+    def _check_username(username):
+        import re
+        if not isinstance(username, str) or not re.fullmatch(r'[\w\u4e00-\u9fff]{2,40}', username):
+            raise Conflict('用户名需要 2–40 位字母、数字或中文')
+
+    def accept_crop(self, task_id, expected, sha256, size, temporary):
+        if size > self.settings.evidence_bytes:
+            raise Conflict('裁剪后仍超过 50MB')
+        destination = self.video(task_id)
+        cropped = destination.with_suffix('.crop.mp4')
+        temporary.replace(cropped)
+        try:
+            with self.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                row = self.editable(db, task_id, expected)
+                if row['status'] != 'NEEDS_CROP':
+                    raise Conflict('只有待裁剪的视频可以裁剪')
+                db.execute("""UPDATE tasks SET status='QUEUED',sha256=?,bytes=?,result=NULL,error=NULL,
+                    attempts=0,updated_at=? WHERE task_id=?""", (sha256, size, time.time(), task_id))
+                self.changed(db, task_id)
+            cropped.replace(destination)
+        except BaseException:
+            cropped.unlink(missing_ok=True)
+            raise
+        return self.get(task_id)
+
+    def attach_stills(self, task_id, names, plate_checked):
+        with self.connection() as db:
+            row = db.execute('SELECT result FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+            if not row:
+                return
+            result = json.loads(row['result']) if row['result'] else {}
+            result['stills'] = names
+            result['stills_plate_checked'] = plate_checked
+            db.execute('UPDATE tasks SET result=? WHERE task_id=?', (json.dumps(result, ensure_ascii=False), task_id))
 
     def claim(self, owner):
         now = time.time()
@@ -431,7 +618,7 @@ class Store:
             shutil.rmtree(folder, ignore_errors=True)
         return True
 
-    def cleanup(self):
+    def cleanup(self, before_delete=None):
         now = time.time()
         with self.connection() as db:
             expiring = [r[0] for r in db.execute("""SELECT task_id FROM tasks WHERE expires_at<?
@@ -443,6 +630,11 @@ class Store:
             expired = [row[0] for row in db.execute("SELECT task_id FROM tasks WHERE status='EXPIRED'")]
             referenced = {row[0] for row in db.execute("SELECT task_id FROM tasks")}
         for task_id in expired:
+            if before_delete:
+                try:
+                    before_delete(task_id)
+                except Exception:
+                    pass
             self.video(task_id).unlink(missing_ok=True)
             (self.settings.data/'previews'/f'{task_id}.mp4').unlink(missing_ok=True)
             folder = self.settings.data/'clips'/task_id
@@ -452,3 +644,20 @@ class Store:
         for path in (self.settings.data / "videos").iterdir():
             if path.is_file() and path.stem not in referenced and path.stat().st_mtime < now - 3600:
                 path.unlink(missing_ok=True)
+
+
+def still_quota(duration_seconds):
+    """3 clear-plate frames on a short clip, one more per 15s, ceiling 8.
+    ponytail: length bins, not a sharpness rank. Upgrade path is plate-size ranking."""
+    return min(8, 3 + int(max(0.0, float(duration_seconds)) // 15))
+
+
+def pick_clear(samples, quota):
+    """samples are (key, plate). Empty plate is not clear. Fewer than 3 clear frames keeps all of them."""
+    clear = [item for item in samples if item[1]]
+    if len(clear) < 3 or len(clear) <= quota:
+        return clear
+    if quota <= 1:
+        return [clear[len(clear) // 2]]
+    step = (len(clear) - 1) / (quota - 1)
+    return [clear[round(i * step)] for i in range(quota)]

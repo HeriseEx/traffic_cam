@@ -20,3 +20,13 @@ starlette==1.6.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.53.0
+vosk==0.3.45
+cffi==2.1.1
+pycparser==3.0
+requests==2.34.2
+charset-normalizer==3.5.1
+urllib3==2.8.0
+srt==3.5.3
+tqdm==4.70.1
+colorama==0.4.6
+websockets==17.1

@@ -5,5 +5,6 @@ __pycache__/
 models/*.onnx
 models/*.part
 models/plate/*.onnx
+models/vosk-model-small-cn-0.22/
 validation/
 web/certs/

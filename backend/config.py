@@ -13,8 +13,9 @@ class Settings:
     model: Path = Path(os.getenv("TRAFFIC_MODEL", "models/yolox_s.onnx")).resolve()
     token: str = os.getenv("TRAFFIC_API_TOKEN", "")
     open: bool = field(default_factory=_open_access)
-    max_bytes: int = int(os.getenv("TRAFFIC_MAX_BYTES", str(50 * 1024 * 1024)))
-    retention_hours: float = float(os.getenv("TRAFFIC_RETENTION_HOURS", "72"))
+    max_bytes: int = int(os.getenv("TRAFFIC_MAX_BYTES", str(200 * 1024 * 1024)))
+    evidence_bytes: int = 50 * 1024 * 1024
+    retention_hours: float = float(os.getenv("TRAFFIC_RETENTION_HOURS", str(30 * 24)))
     max_seconds: float = float(os.getenv("TRAFFIC_MAX_SECONDS", "600"))
     sample_fps: float = 2
     lease_seconds: int = 300

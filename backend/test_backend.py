@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import secrets
 import subprocess
@@ -6,18 +7,20 @@ import tempfile
 import time
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app import create_app, Event
 from config import Settings
-from inference import Detector, Tracker, clip_windows, bind_plates
-from store import Store
+from inference import Detector, Tracker, clip_windows, bind_plates, retain_stills
+from store import Store, pick_clear, still_quota
 from worker import process_one
 from schemas import AnalysisConfig
 from plates import PlateReader, consensus, ctc_decode, onnxocr_decode, ONNXOCR_CHARS
-from rules import candidates, red_approach, red_approaches, red_light_candidate, lane_changes, red_during_laterals, restricted_park, turned_from_green
+from rules import candidates, red_approach, red_approaches, red_light_candidate, lane_changes, red_during_laterals, restricted_park, turned_from_green, stop_crossings, drive_events, stop_y_of
+from speech import match_offence
 from signals import SignalMachine, ThroughLamp, detect_lights, observe, color_of
 import cv2
 import numpy as np
@@ -145,6 +148,9 @@ class BackendTest(unittest.TestCase):
                 self.assertTrue(store.client_ok(device['session']))
                 self.assertEqual(browser.get('/v1/overview').json()['client_count'], 2)
                 content = (root/'tests/traffic.mp4').read_bytes()
+                self.assertEqual(browser.post('/v1/bootstrap', json={'username': 'root', 'password': 'admin-pass'}).status_code, 200)
+                invite = browser.post('/v1/invites').json()['token']
+                self.assertEqual(browser.post('/v1/register', json={'token': invite, 'username': 'alice', 'password': 'user-pass1'}).status_code, 200)
                 headers = {'X-Requested-With': 'traffic-console', 'X-Event-Metadata': json.dumps({'event_id': str(uuid.uuid4())}),
                            'X-Video-SHA256': hashlib.sha256(content).hexdigest()}
                 task = browser.post('/v1/tasks', content=content, headers=headers).json()
@@ -162,6 +168,7 @@ class BackendTest(unittest.TestCase):
                 clips = store.clips_dir(task['task_id']); clips.mkdir(parents=True)
                 (clips/'0.mp4').write_bytes(content)
                 self.assertEqual(browser.get(f"/v1/tasks/{task['task_id']}/clips/0", headers={'Range': 'bytes=0-31'}).status_code, 206)
+                browser.cookies.delete('traffic_account')
                 self.assertEqual(browser.post('/v1/archive').status_code, 403)
                 self.assertEqual(browser.delete('/v1/session', headers={'X-Requested-With':'traffic-console'}).status_code, 200)
                 self.assertEqual(browser.get(video).status_code, 401)
@@ -200,7 +207,7 @@ class BackendTest(unittest.TestCase):
                 self.assertEqual(client.put('/v1/settings',json=body).status_code,403)
                 self.assertEqual(client.put('/v1/settings',headers={'X-Requested-With':'traffic-console'},json=body).status_code,200)
                 self.assertEqual(client.put('/v1/settings',headers=auth,json=body).status_code,409)
-                task=client.post('/v1/tasks',content=content,headers={**auth,'X-Event-Metadata':json.dumps({'event_id':str(uuid.uuid4()),'trigger':'voice','trigger_text':'开始标记'},ensure_ascii=True),'X-Video-SHA256':hashlib.sha256(content).hexdigest()}).json()
+                task=client.post('/v1/tasks',content=content,headers={**auth,'X-Event-Metadata':json.dumps({'event_id':str(uuid.uuid4()),'trigger':'voice','trigger_text':'开始标记','location_note':'仪器测试'},ensure_ascii=True),'X-Video-SHA256':hashlib.sha256(content).hexdigest()}).json()
                 self.assertEqual(task['analysis_config']['vehicle_model'],'yolox_tiny')
                 lamp=np.zeros((180,320,3),np.uint8); cv2.circle(lamp,(160,40),5,(0,0,255),-1)
                 ok,jpeg=cv2.imencode('.jpg',lamp)
@@ -326,10 +333,12 @@ class BackendTest(unittest.TestCase):
         self.assertTrue(red_approach(leaving)['proceeding'])
         self.assertFalse(red_approach(leaving)['approaching'])
         plates=[{'text':'川A10001','stable':True,'hits':4,'confidence':.99}]
+        self.assertIsNone(red_light_candidate({'color':'RED','stable':True,'since_seconds':0},found,plates))
+        found['crossed_stop_line']=True
         hit=red_light_candidate({'color':'RED','stable':True,'since_seconds':0},found,plates)
         self.assertEqual(hit['type'],'RED_LIGHT')
         self.assertEqual(hit['plate'],'川A10001')
-        self.assertEqual(red_light_candidate({'color':'RED','stable':True},red_approach(leaving),plates)['type'],'RED_LIGHT')
+        self.assertIsNone(red_light_candidate({'color':'RED','stable':True},red_approach(leaving),plates))
         self.assertIsNone(red_light_candidate({'color':'RED','stable':True},red_approach(waiting),plates))
         self.assertIsNone(red_light_candidate({'color':'RED','stable':True},found,[]))
         # Hood-sized boxes must not beat the car ahead; plate stitches tracker fragments.
@@ -394,8 +403,9 @@ class BackendTest(unittest.TestCase):
         laterals=[{'type':'SOLID_LINE','track_id':2,'time_seconds':5.0},
                   {'type':'SOLID_LINE','track_id':3,'time_seconds':5.5}]
         red_frames=[{'time_seconds':t,'signal_observed':'RED'} for t in (4.5,5.0,5.5)]
-        self.assertEqual({item['track_id'] for item in red_during_laterals(red_frames,laterals)},{2,3})
-        self.assertEqual(red_during_laterals(red_frames,laterals,{2,3}),[])
+        self.assertEqual(red_during_laterals(red_frames,laterals),[])
+        self.assertEqual({item['track_id'] for item in red_during_laterals(red_frames,laterals,crossed={2,3})},{2,3})
+        self.assertEqual(red_during_laterals(red_frames,laterals,{2,3},{2,3}),[])
         turning=[{'time_seconds':t,'signal_observed':('GREEN' if t<5 else 'RED'),
                   'vehicles':[{'track_id':4,'box_normalized':[.4+t*.03,.4,.55+t*.03,.6]}]}
                  for t in (2.0,3.0,4.0,4.5,5.0,5.5,6.0)]
@@ -500,7 +510,7 @@ class BackendTest(unittest.TestCase):
                 # v1 records predate the optional trigger and scene fields.
                 with store.connection() as db:
                     old=store.get(task_id)['metadata']
-                    for key in ('trigger','trigger_text','scene','capture'): old.pop(key)
+                    for key in ('trigger','trigger_text','scene','capture','location','location_note'): old.pop(key)
                     db.execute('UPDATE tasks SET metadata=? WHERE task_id=?',(json.dumps(old),task_id))
                 self.assertEqual(upload(client).status_code,200)
                 self.assertEqual(upload(client, metadata={**event, "candidate_type": "RED_LIGHT"}).status_code, 409)
@@ -563,9 +573,14 @@ class BackendTest(unittest.TestCase):
                 code=pair.json()['code']
                 self.assertEqual(len(code),8)
                 event={"event_id": str(uuid.uuid4())}
-                again=client.post("/v1/tasks", content=content, headers={
+                paired=client.post("/v1/tasks", content=content, headers={
                     "Authorization": f"Bearer {code}", "Content-Type": "video/mp4",
                     "X-Event-Metadata": json.dumps(event),
+                    "X-Video-SHA256": hashlib.sha256(content).hexdigest()})
+                self.assertEqual(paired.status_code,403)
+                again=client.post("/v1/tasks", content=content, headers={
+                    **auth, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps({"event_id": str(uuid.uuid4())}),
                     "X-Video-SHA256": hashlib.sha256(content).hexdigest()})
                 self.assertEqual(again.status_code,202)
 
@@ -740,6 +755,9 @@ class BackendTest(unittest.TestCase):
         self.assertFalse(waiting['proceeding'])
         self.assertEqual(passing['track_id'], 2)
         self.assertTrue(passing['proceeding'])
+        self.assertIsNone(red_light_candidate({'color': 'RED', 'stable': True, 'since_seconds': 0}, passing,
+                                              [{'text': '川APASS01', 'stable': True}]))
+        passing['crossed_stop_line'] = True
         hit = red_light_candidate({'color': 'RED', 'stable': True, 'since_seconds': 0}, passing,
                                   [{'text': '川APASS01', 'stable': True}])
         self.assertEqual(hit['track_id'], 2)
@@ -753,6 +771,249 @@ class BackendTest(unittest.TestCase):
                 {'track_id': 2, 'score': .9, 'box_normalized': [.20, .42, .34, .56 + grow]},
             ], 'plates': [{'text': '川AWAIT01', 'track_id': 1, 'box_normalized': [.48, .52, .54, .57]}]})
         self.assertFalse(red_approach(ego, '川AWAIT01')['proceeding'])
+
+
+class EvidenceGateTest(unittest.TestCase):
+    def test_automatic_without_plate_is_rejected_and_parking_can_be_filtered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data=Path(directory), token="local-test-token-do-not-deploy", reserve_bytes=0)
+            app = create_app(settings)
+            body = b"parking-bytes"
+            digest = hashlib.sha256(body).hexdigest()
+
+            def post(client, metadata):
+                return client.post("/v1/tasks", content=body, headers={
+                    "Authorization": f"Bearer {settings.token}", "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps(metadata, ensure_ascii=True),
+                    "X-Video-SHA256": digest})
+
+            capture = {"camera_mode": "moving", "captured_at": 1, "duration_ms": 1000, "recording_gaps_ms": 0,
+                       "incidents": [
+                           {"track_id": 1, "kind": "ILLEGAL_PARKING", "start_ms": 0, "end_ms": 1,
+                            "plate": "川A12345", "plate_confirmed": True},
+                           {"track_id": 1, "kind": "ILLEGAL_PARKING", "start_ms": 1, "end_ms": 2,
+                            "plate": "川A12345", "plate_confirmed": True}]}
+            with TestClient(app) as client:
+                denied = post(client, {"event_id": str(uuid.uuid4()), "trigger": "automatic", "candidate_type": "RED_LIGHT"})
+                self.assertEqual(denied.status_code, 422)
+                mismatch = json.loads(json.dumps(capture))
+                mismatch["incidents"][1]["plate"] = "川B12345"
+                unequal = post(client, {"event_id": str(uuid.uuid4()), "trigger": "manual",
+                    "candidate_type": "ILLEGAL_PARKING", "location_note": "路口东侧", "capture": mismatch})
+                self.assertEqual(unequal.status_code, 422)
+                accepted = post(client, {"event_id": str(uuid.uuid4()), "trigger": "manual",
+                    "candidate_type": "ILLEGAL_PARKING", "location_note": "路口东侧", "capture": capture})
+                self.assertEqual(accepted.status_code, 202)
+                self.assertTrue(process_one(app.state.store, None, "parking-worker"))
+                task = accepted.json()
+                stored = client.get(f"/v1/tasks/{task['task_id']}", headers={"Authorization": f"Bearer {settings.token}"}).json()
+                self.assertEqual(stored["status"], "ANALYZED")
+                self.assertEqual(stored["result"]["plate"], "川A12345")
+                auth = {"Authorization": f"Bearer {settings.token}"}
+                self.assertEqual(len(client.get("/v1/tasks", headers=auth, params={"violation": "ILLEGAL_PARKING"}).json()["tasks"]), 1)
+                self.assertEqual(client.get("/v1/tasks", headers=auth, params={"violation": "RED_LIGHT"}).json()["tasks"], [])
+                imported = post(client, {"event_id": str(uuid.uuid4()), "trigger": "import"})
+                self.assertEqual(imported.status_code, 202)
+
+    def test_parking_photos_are_served_instead_of_a_video(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data=Path(directory), token="local-test-token-do-not-deploy", reserve_bytes=0)
+            app = create_app(settings)
+            bundle = io.BytesIO()
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("spot.jpg", b"\xff\xd8rear\xff\xd9")
+                archive.writestr("front.jpg", b"\xff\xd8front\xff\xd9")
+            body = bundle.getvalue()
+            digest = hashlib.sha256(body).hexdigest()
+            capture = {"camera_mode": "moving", "captured_at": 1_700_000_000, "duration_ms": 2, "recording_gaps_ms": 0,
+                       "incidents": [
+                           {"track_id": 1, "kind": "ILLEGAL_PARKING", "start_ms": 0, "end_ms": 1,
+                            "plate": "川A12345", "plate_confirmed": True},
+                           {"track_id": 1, "kind": "ILLEGAL_PARKING", "start_ms": 1, "end_ms": 2,
+                            "plate": "川A12345", "plate_confirmed": True}]}
+            metadata = {"event_id": str(uuid.uuid4()), "trigger": "manual", "candidate_type": "ILLEGAL_PARKING",
+                        "location": {"latitude": 30.5728, "longitude": 104.0668, "address": "人民南路"},
+                        "capture": capture}
+            auth = {"Authorization": f"Bearer {settings.token}"}
+            with TestClient(app) as client:
+                accepted = client.post("/v1/tasks", content=body, headers={
+                    **auth, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps(metadata, ensure_ascii=True),
+                    "X-Video-SHA256": digest})
+                self.assertEqual(accepted.status_code, 202)
+                task_id = accepted.json()["task_id"]
+                rear = client.get(f"/v1/tasks/{task_id}/photos/spot", headers=auth)
+                front = client.get(f"/v1/tasks/{task_id}/photos/front", headers=auth)
+                self.assertEqual(rear.status_code, 200)
+                self.assertEqual(rear.content, b"\xff\xd8rear\xff\xd9")
+                self.assertEqual(rear.headers["content-type"], "image/jpeg")
+                self.assertEqual(front.content, b"\xff\xd8front\xff\xd9")
+                self.assertEqual(client.get(f"/v1/tasks/{task_id}/photos/other", headers=auth).status_code, 404)
+                self.assertEqual(client.get(f"/v1/tasks/{task_id}/video", headers=auth).status_code, 404)
+                stored = client.get(f"/v1/tasks/{task_id}", headers=auth).json()
+                self.assertEqual(stored["metadata"]["location"]["address"], "人民南路")
+
+    def test_oversize_waits_for_crop_and_expiry_keeps_stills(self):
+        self.assertEqual(still_quota(10), 3)
+        self.assertEqual(still_quota(15), 4)
+        self.assertEqual(still_quota(200), 8)
+        self.assertEqual([item[0] for item in pick_clear([(0, "A"), (1, "")], 8)], [0])
+        self.assertEqual(len(pick_clear([(i, "川A") for i in range(6)], 3)), 3)
+        root = Path(__file__).resolve().parent
+        content = (root / "tests/traffic.mp4").read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data=Path(directory), token="local-test-token-do-not-deploy", reserve_bytes=0)
+            settings.evidence_bytes = len(content) - 1
+            app = create_app(settings)
+            digest = hashlib.sha256(content).hexdigest()
+            metadata = {"event_id": str(uuid.uuid4()), "trigger": "import"}
+            with TestClient(app) as client:
+                accepted = client.post("/v1/tasks", content=content, headers={
+                    "Authorization": f"Bearer {settings.token}", "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps(metadata), "X-Video-SHA256": digest})
+                self.assertEqual(accepted.status_code, 202)
+                task = accepted.json()
+                self.assertEqual(task["status"], "NEEDS_CROP")
+                self.assertIsNone(app.state.store.claim("crop-test"))
+                settings.evidence_bytes = 50 * 1024 * 1024
+                cropped = client.post(f"/v1/tasks/{task['task_id']}/crop", headers={
+                    "Authorization": f"Bearer {settings.token}", "Content-Type": "application/json"},
+                    json={"expected_revision": task["revision"], "start_seconds": 0, "end_seconds": 1})
+                self.assertEqual(cropped.status_code, 200, cropped.text)
+                self.assertEqual(cropped.json()["status"], "QUEUED")
+                self.assertLessEqual(cropped.json()["bytes"], settings.evidence_bytes)
+                retain_stills(app.state.store, task["task_id"], None)
+                with app.state.store.connection() as db:
+                    db.execute("UPDATE tasks SET expires_at=? WHERE task_id=?", (time.time() - 1, task["task_id"]))
+                app.state.store.cleanup()
+                self.assertFalse(app.state.store.video(task["task_id"]).exists())
+                self.assertTrue(any((settings.data / "stills" / task["task_id"]).glob("still-*.jpg")))
+
+
+class GeometrySpeechTest(unittest.TestCase):
+    def test_stop_line_and_lane_rules_do_not_invent_cut_in(self):
+        gray = np.zeros((90, 160), np.uint8)
+        gray[50, 10:150] = 220
+        self.assertAlmostEqual(stop_y_of(gray), 50 / 90, places=2)
+        self.assertIsNone(stop_y_of(np.zeros((90, 160), np.uint8)))
+        stable = []
+        for i in range(6):
+            bottom = .42 + i * .056
+            stable.append({'time_seconds': i * .5, 'stop_y': .55, 'lines': [],
+                           'vehicles': [{'track_id': 1, 'score': .9, 'box_normalized': [.4, bottom - .2, .55, bottom]}]})
+        self.assertEqual(stop_crossings(stable), {1})
+        sliding = [{**frame, 'stop_y': .30 + i * .08} for i, frame in enumerate(stable)]
+        self.assertEqual(stop_crossings(sliding), set())
+        solid = {'a': [.50, .2], 'b': [.50, .9], 'solid': True}
+        frames = []
+        for i, x in enumerate((.30, .38, .46, .62)):
+            frames.append({'time_seconds': i * .5, 'lines': [solid], 'vehicles': [
+                {'track_id': 1, 'score': .9, 'signal_off': True, 'box_normalized': [x - .05, .4, x + .05, .7]}]})
+        kinds = {item['type'] for item in drive_events(frames)}
+        self.assertIn('SOLID_LINE', kinds)
+        self.assertIn('NO_SIGNAL', kinds)
+        self.assertNotIn('DANGEROUS_CHANGE', kinds)
+        self.assertNotIn('CUT_IN', kinds)
+        self.assertIsNone(match_offence(''))
+        self.assertEqual(match_offence('他 闯 红灯 了'), 'RED_LIGHT')
+        self.assertEqual(match_offence('前面那辆变道不打灯'), 'NO_SIGNAL')
+        self.assertIsNone(match_offence('今天天气不错'))
+        from speech import model_dir
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+        SetLogLevel(-1)
+        recognizer = KaldiRecognizer(Model(str(model_dir())), 16000)
+        recognizer.AcceptWaveform(b'\0' * 32000)
+        heard = json.loads(recognizer.FinalResult())
+        self.assertIn('text', heard)
+        self.assertIsNone(match_offence(heard.get('text') or ''))
+        from speech import apply_transcript
+        from worker import unplated_rejection
+        kept = apply_transcript(
+            {'decision': 'REJECTED', 'reason': 'PLATE_UNCONFIRMED', 'violation_type': None, 'violations': []},
+            '', 'clip')
+        self.assertEqual(kept['reason'], 'SPOKEN_UNMATCHED')
+        self.assertEqual(kept['decision'], 'UNKNOWN')
+        self.assertFalse(unplated_rejection(kept, 'manual', True, False))
+        self.assertEqual(kept['transcript'], '')
+        matched = apply_transcript(
+            {'decision': 'REJECTED', 'reason': 'PLATE_UNCONFIRMED', 'violation_type': None, 'violations': []},
+            '闯红灯', 'clip')
+        self.assertEqual(matched['spoken_type'], 'RED_LIGHT')
+        self.assertEqual(matched['reason'], 'SPOKEN_MATCH')
+        self.assertFalse(unplated_rejection(matched, 'voice', True, False))
+        auto = {'decision': 'UNKNOWN', 'reason': 'NO_VEHICLES_DETECTED'}
+        self.assertTrue(unplated_rejection(auto, 'automatic', True, False))
+        self.assertEqual(auto['reason'], 'PLATE_UNCONFIRMED')
+
+
+class AccountTest(unittest.TestCase):
+    def test_admin_cannot_upload_and_invite_is_single_use(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data=Path(directory), token="local-test-token-do-not-deploy", reserve_bytes=0)
+            app = create_app(settings)
+            body = b"account-video"
+            digest = hashlib.sha256(body).hexdigest()
+            with TestClient(app) as client:
+                self.assertTrue(client.get("/v1/bootstrap").json()["needs_admin"])
+                admin = client.post("/v1/bootstrap", json={"username": "root", "password": "admin-pass"})
+                self.assertEqual(admin.status_code, 200, admin.text)
+                admin_headers = {"Authorization": f"Bearer {admin.json()['session']}"}
+                denied = client.post("/v1/tasks", content=body, headers={
+                    **admin_headers, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps({"event_id": str(uuid.uuid4()), "trigger": "manual", "location_note": "现场"}),
+                    "X-Video-SHA256": digest})
+                self.assertEqual(denied.status_code, 403)
+                imported = client.post("/v1/tasks", content=body, headers={
+                    **admin_headers, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps({"event_id": str(uuid.uuid4()), "trigger": "import"}),
+                    "X-Video-SHA256": digest})
+                self.assertEqual(imported.status_code, 202, imported.text)
+                self.assertEqual(imported.json()["uploader"], "root")
+                invite = client.post("/v1/invites", headers=admin_headers)
+                self.assertEqual(invite.status_code, 200)
+                page = client.get("/join")
+                self.assertEqual(page.status_code, 200)
+                self.assertIn("注册取证账户", page.text)
+                token = invite.json()["token"]
+                user = client.post("/v1/register", json={"token": token, "username": "alice", "password": "user-pass1"})
+                self.assertEqual(user.status_code, 200, user.text)
+                self.assertEqual(client.post("/v1/register", json={"token": token, "username": "bob", "password": "user-pass1"}).status_code, 409)
+                user_headers = {"Authorization": f"Bearer {user.json()['session']}"}
+                uploaded = client.post("/v1/tasks", content=body, headers={
+                    **user_headers, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps({"event_id": str(uuid.uuid4())}),
+                    "X-Video-SHA256": digest})
+                self.assertEqual(uploaded.status_code, 202, uploaded.text)
+                self.assertEqual(uploaded.json()["uploader"], "alice")
+                self.assertEqual(client.get("/v1/tasks", headers=admin_headers).json()["tasks"][0]["uploader"], "alice")
+                self.assertEqual(client.get(f"/v1/tasks/{imported.json()['task_id']}", headers=user_headers).status_code, 404)
+                mine = client.get("/v1/tasks", headers=user_headers).json()["tasks"]
+                self.assertTrue(mine and all(row["uploader"] == "alice" for row in mine))
+                user_overview = client.get("/v1/overview", headers=user_headers).json()
+                self.assertEqual(user_overview["scope"], "mine")
+                self.assertNotIn("clients", user_overview)
+                self.assertEqual(user_overview["total"], 1)
+                self.assertIn("queue", user_overview)
+                settings.evidence_bytes = 4
+                over = b"12345"
+                over_digest = hashlib.sha256(over).hexdigest()
+                self.assertEqual(client.post("/v1/tasks", content=over, headers={
+                    **user_headers, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps({"event_id": str(uuid.uuid4()), "trigger": "import"}),
+                    "X-Video-SHA256": over_digest}).status_code, 413)
+                self.assertEqual(client.post("/v1/tasks", content=over, headers={
+                    **admin_headers, "Content-Type": "video/mp4",
+                    "X-Event-Metadata": json.dumps({"event_id": str(uuid.uuid4()), "trigger": "import"}),
+                    "X-Video-SHA256": over_digest}).status_code, 202)
+                self.assertEqual(client.put("/v1/retention", json={"days": 7}, headers=admin_headers).json()["retention_days"], 7)
+                self.assertEqual(client.put("/v1/retention", json={"days": 9}, headers=user_headers).status_code, 403)
+                self.assertEqual(client.post("/v1/archive", headers=user_headers).status_code, 403)
+                self.assertEqual(client.post(
+                    f"/v1/tasks/{uploaded.json()['task_id']}/crop", headers=user_headers,
+                    json={"expected_revision": 1, "start_seconds": 0, "end_seconds": 1}).status_code, 403)
+                self.assertEqual(client.post("/v1/archive", headers=admin_headers).json()["archived"], 3)
+                self.assertEqual(client.post("/v1/users/alice/disable", headers=admin_headers).status_code, 200)
+                self.assertEqual(client.post("/v1/login", json={"username": "alice", "password": "user-pass1"}).status_code, 401)
 
 
 if __name__ == "__main__":

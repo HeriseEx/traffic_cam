@@ -16,9 +16,11 @@ class PasswordError(Exception):
         self.retry_after = retry_after
 
 
-def hash_password(password):
-    if not 15 <= len(password) <= 128:
-        raise ValueError('管理密码必须为 15–128 个字符，可使用长口令。')
+def hash_password(password, min_len=15):
+    if not min_len <= len(password) <= 128:
+        if min_len == 15:
+            raise ValueError('管理密码必须为 15–128 个字符，可使用长口令。')
+        raise ValueError(f'密码必须为 {min_len}–128 个字符。')
     salt = secrets.token_bytes(16)
     # OWASP scrypt option: 32 MiB, r=8, p=3; no extra runtime dependency.
     key = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=32768, r=8, p=3, dklen=32, maxmem=64*1024*1024)

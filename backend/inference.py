@@ -11,7 +11,8 @@ from schemas import AnalysisConfig
 from plates import consensus
 import shutil
 from pathlib import Path
-from rules import MotionGate, candidates, red_approaches, red_light_candidate, lane_changes, restricted_park, red_during_laterals, turned_from_green
+from rules import (MotionGate, candidates, red_approaches, red_light_candidate, lane_changes, restricted_park,
+    red_during_laterals, turned_from_green, frame_marks, lamp_off, stop_crossings, drive_events, calibrated_marks)
 from signals import SignalMachine, ThroughLamp, detect_lights, observe
 
 import cv2
@@ -301,8 +302,10 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
                         if plate['confidence']>=vehicle.get('plate_confidence',-1):
                             vehicle['plate']=plate['text']
                             vehicle['plate_confidence']=plate['confidence']
+                marks = frame_marks(image)
                 for detection in detections:
                     detection['appearance']=appearance_of(image, detection['box'])
+                    detection['signal_off']=lamp_off(image, detection['box'])
                 detections = tracker.update(detections, index)
                 for detection in detections:
                     detection.pop('appearance', None)
@@ -328,7 +331,8 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
                 seen = through.update(lights)
                 snap = signals.update(seen, time_seconds)
                 frames.append({"time_seconds": time_seconds, "vehicles": detections,'plates':plates,
-                               'lights':lights,'signal_observed':seen,'signal_color':snap['color']})
+                               'lights':lights,'signal_observed':seen,'signal_color':snap['color'],
+                               'stop_y': marks['stop_y'], 'lines': marks['lines']})
             code = process.wait(timeout=10)
             if code != 0 or not frames:
                 raise InvalidVideo("Video decoding failed or produced no frames")
@@ -342,8 +346,12 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
     plate_ok={p['text'] for p in plates if p.get('stable') and p.get('text')}
     violations,assessment,approach,red=[],'PLATE_UNCONFIRMED',None,None
     if not config.plate_enabled or plate_ok:
+        marked=calibrated_marks(frames, scene, motion.status()) if config.rules_enabled else frames
+        crossed=stop_crossings(marked) if config.rules_enabled else set()
         violations,assessment=candidates(frames,scene,motion.status(),config.rules_enabled)
         approaches=red_approaches(frames, list(plate_ok))
+        for item in approaches:
+            item['crossed_stop_line']=item['track_id'] in crossed
         approach=approaches[0] if approaches else None
         proceeding=any(item.get('proceeding') or item.get('approaching') for item in approaches)
         signal=({'color':'RED','stable':True} if proceeding else signals.snapshot())
@@ -353,17 +361,32 @@ def analyze(path, detector, settings, heartbeat=lambda: True, config=None, plate
                 hit=red_light_candidate(signal,item,plates,plate_text=item.get('plate'))
                 if hit:
                     reds.append(hit)
+            violations.extend(drive_events(marked, motion.status()))
             if not (scene or {}).get('fixed_camera'):
                 laterals=lane_changes(frames)
                 violations.extend(laterals)
                 violations.extend(restricted_park(frames))
-                reds.extend(red_during_laterals(frames, laterals, {item['track_id'] for item in reds}))
+                reds.extend(red_during_laterals(frames, laterals, {item['track_id'] for item in reds}, crossed))
             reds=[item for item in reds if not turned_from_green(frames, item['track_id'], item['time_seconds'])]
         violations=[*reds,*violations]
         violations=bind_plates(violations, frames, plates, config.plate_min_hits)
         red=next((item for item in violations if item.get('type')=='RED_LIGHT'), None)
         if red:
             assessment='RED_LIGHT_CANDIDATE'
+        seen_kinds=set()
+        unique=[]
+        for item in violations:
+            key=(item.get('type'), item.get('track_id'))
+            if key in seen_kinds:
+                continue
+            seen_kinds.add(key)
+            unique.append(item)
+        violations=unique
+    for frame in frames:
+        frame.pop('lines', None)
+        frame.pop('stop_y', None)
+        for vehicle in frame.get('vehicles') or []:
+            vehicle.pop('signal_off', None)
     presence=bool(counts or plates)
     return {
         "schema_version": 2,
@@ -515,3 +538,57 @@ def extract_clips(source, violations, dest, duration, frames=None):
             item['clip_start']=clip['start_seconds']
             item['clip_end']=clip['end_seconds']
     return clips
+
+
+def retain_stills(store, task_id, reader=None):
+    """Keep 3–8 frames before the video file is deleted. A plate reader keeps only clear plates."""
+    from store import pick_clear, still_quota
+    path = store.video(task_id)
+    if not path.is_file():
+        return
+    dest = store.settings.data / 'stills' / task_id
+    dest.mkdir(parents=True, exist_ok=True)
+    if any(dest.glob('still-*.jpg')):
+        return
+    try:
+        probed = json.loads(subprocess.check_output(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', str(path)],
+            timeout=30))
+        duration = float(probed['format']['duration'])
+    except (subprocess.SubprocessError, OSError, KeyError, ValueError, json.JSONDecodeError):
+        return
+    quota = still_quota(duration)
+    count = min(16, max(quota * 2, quota))
+    grabbed = []
+    for index in range(count):
+        at = 0 if duration <= 0 else max(0, min(duration * (index + 0.5) / count, max(0, duration - 0.05)))
+        jpg = dest / f'tmp-{index}.jpg'
+        try:
+            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-ss', f'{at:.3f}', '-i', str(path),
+                            '-frames:v', '1', '-q:v', '3', str(jpg)],
+                           check=True, timeout=60, capture_output=True)
+        except (subprocess.SubprocessError, OSError):
+            jpg.unlink(missing_ok=True)
+            continue
+        if not jpg.is_file() or jpg.stat().st_size < 100:
+            jpg.unlink(missing_ok=True)
+            continue
+        plate = 'frame'
+        if reader is not None:
+            image = cv2.imread(str(jpg))
+            hits = reader.read(image, 0.85) if image is not None else []
+            plate = hits[0]['text'] if hits else ''
+        grabbed.append((jpg.name, plate))
+    chosen = pick_clear(grabbed, quota)
+    saved = []
+    for name, _plate in chosen:
+        source = dest / name
+        if not source.is_file():
+            continue
+        target = dest / f'still-{len(saved)}.jpg'
+        source.replace(target)
+        saved.append(target.name)
+    for jpg in dest.glob('tmp-*.jpg'):
+        jpg.unlink(missing_ok=True)
+    if saved:
+        store.attach_stills(task_id, saved, reader is not None)

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>注册取证账户</title><link rel="stylesheet" href="/static/style.css?v=17"><script defer src="/static/join.js?v=1"></script></head>
+<body>
+<main>
+<form id="joinForm">
+<p class="eyebrow">INVITE</p>
+<h1>注册取证账户</h1>
+<p>这条邀请 30 分钟内有效，只能使用一次。服务地址是 <strong id="server"></strong>。注册后在手机「服务器与记录」填写同一地址，用这里设置的用户名和密码登录。</p>
+<label>用户名<input id="username" autocomplete="username" required minlength="2" maxlength="40"></label>
+<label>密码<input id="password" type="password" autocomplete="new-password" required minlength="8" maxlength="128"></label>
+<p id="joinError" class="error"></p>
+<button class="primary" type="submit">注册并登录</button>
+</form>
+</main>
+</body></html>

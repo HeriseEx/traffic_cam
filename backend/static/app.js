@@ -1,14 +1,18 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const state = {records: [], task: null, offset: 0, config: null, dirty: false, scene: {}, draw: null, points: [], loading: false, clipStart: 0};
-const labels = {QUEUED:'排队中',PROCESSING:'分析中',ANALYZED:'分析完成',REJECTED:'未检出 / 无效',ERROR:'处理失败',EXPIRED:'已过期',
+const labels = {QUEUED:'排队中',PROCESSING:'分析中',ANALYZED:'分析完成',REJECTED:'未检出 / 无效',ERROR:'处理失败',EXPIRED:'已过期',NEEDS_CROP:'待裁剪',
   UNKNOWN:'无法可靠判定',CANDIDATE:'发现疑似候选',CONFIRMED:'人工确认',VALID:'人工确认',INVALID:'人工标记无效',UNCERTAIN:'证据不足',RESET:'恢复 AI 结果',
-  NONE:'未发现违法',SOLID_LINE:'疑似压实线',LATERAL_MOVEMENT:'横向移动（待复核）',WRONG_WAY:'疑似逆行',RED_LIGHT:'疑似闯红灯',RESTRICTED_LANE:'疑似占用非机动车道',
+  NONE:'未发现违法',SOLID_LINE:'压实线',LATERAL_MOVEMENT:'横向移动（待复核）',WRONG_WAY:'逆行',RED_LIGHT:'闯红灯',RESTRICTED_LANE:'疑似占用非机动车道',
+  EMERGENCY_LANE:'侵走高速应急车道',NO_SIGNAL:'变道不打灯',OVERTAKE:'越线超车',DANGEROUS_CHANGE:'危险变道',CUT_IN:'加塞',ILLEGAL_PARKING:'主城区机动车乱停乱放',
   RED:'红灯',GREEN:'绿灯',YELLOW:'黄灯',OFF:'未见到灯',
   NEEDS_CALIBRATION:'缺少固定机位与道路标定',MOVING_CAMERA:'画面移动，暂停几何规则',INSUFFICIENT_BACKGROUND:'背景特征不足，无法判断机位',
-  RED_LIGHT_CANDIDATE:'红灯稳定且前车继续接近，仅作候选',
+  RED_LIGHT_CANDIDATE:'红灯稳定且越过停止线，仅作候选',
+  SPOKEN_MATCH:'口述匹配到违法目录',SPOKEN_UNMATCHED:'口述未能匹配目录，待人工修改',
+  NO_AUDIO:'没有可转写的音轨',NO_MODEL:'语音模型未就绪',NO_ENGINE:'服务器未安装转写引擎',
   PLATE_UNCONFIRMED:'未确认车牌，已停止违法判定',
   VIOLATION_RULES_NOT_IMPLEMENTED:'旧版本未启用违法规则',HUMAN_INVALIDATED:'人工标记无效',HUMAN_UNCERTAIN:'人工标记证据不足',HUMAN_CONFIRMED:'人工确认 / 纠正',
+  PARKING_PHOTOS:'两张原片',
   manual:'按钮标记',voice:'语音标记',automatic:'自动筛查',import:'导入视频',car:'汽车',truck:'卡车',bus:'公交车',motorcycle:'摩托车'};
 const title = v => labels[v] || v || '—';
 function plateTrust(plate){return (plate.stable?1e6:0)+(plate.hits||0)*1e3+(plate.confidence||0)*100;}
@@ -25,58 +29,71 @@ async function sha256hex(text){
   const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
   return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
-let session='', sessionPromise=null;
+let session='', account=null;
 let mediaRetry=false;
+function showLogin(needsAdmin){
+  $('loginTitle').textContent=needsAdmin?'创建管理员':'登录';
+  $('loginSubmit').textContent=needsAdmin?'创建并进入':'登录';
+  $('loginHint').textContent=needsAdmin?'还没有管理员。这里的第一次登录会创建管理员账户。':'管理员可以邀请用户、设置保留期和停用账户，但不能上传视频。';
+  $('loginForm').dataset.mode=needsAdmin?'bootstrap':'login';
+  if(!$('loginDialog').open)$('loginDialog').showModal();
+}
 async function ensureSession(){
-  if(session)return;
-  if(sessionPromise)return sessionPromise;
-  sessionPromise=(async()=>{
-    const ts=Math.floor(Date.now()/1000),nonce=crypto.randomUUID().replaceAll('-','');
-    let device;
-    try{device=localStorage.getItem('traffic-device-id');}catch{}
-    if(!device)device=crypto.randomUUID();
-    const platform='web';
-    const code=await sha256hex(`${device}\n${platform}\n${ts}\n${nonce}\ntraffic-hello-v1`);
-    const response=await fetch('/v1/hello',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:device,platform,model:(navigator.userAgent||'web').slice(0,120),app_version:'2.0',ts,nonce,code})});
-    const data=await response.json();
-    if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'握手失败');
-    session=data.session;
-    try{localStorage.setItem('traffic-device-id',data.device_id||device);}catch{}
-  })();
-  try{await sessionPromise;}finally{sessionPromise=null;}
+  if(account)return;
+  const me=await fetch('/v1/account',{credentials:'same-origin',headers:{'X-Requested-With':'traffic-console'}});
+  if(me.ok){account=await me.json();session='cookie';return;}
+  const boot=await fetch('/v1/bootstrap').then(response=>response.json());
+  showLogin(!!boot.needs_admin);
+  throw new Error('请登录');
 }
 async function api(path, options={}, retried=false) {
   await ensureSession();
-  const headers={'X-Requested-With':'traffic-console',Authorization:'Bearer '+session,...(options.headers||{})};
+  const headers={'X-Requested-With':'traffic-console',...(options.headers||{})};
+  if(session && session!=='cookie')headers.Authorization='Bearer '+session;
   const next={...options};
   if(next.json!==undefined){next.body=JSON.stringify(next.json);headers['Content-Type']='application/json';delete next.json;}
   const response=await fetch(path,{...next,headers,credentials:'same-origin'});
-  if(response.status===401 && !retried){session='';return api(path,options,true);}
+  if(response.status===401 && !retried){session='';account=null;return api(path,options,true);}
   const data=await response.json();
   if(!response.ok){const detail=typeof data.detail==='string'?data.detail:JSON.stringify(data.detail);const error=new Error(detail||`请求失败 ${response.status}`);error.status=response.status;error.retryAfter=Number(data.retry_after||response.headers.get('Retry-After')||0);throw error;}
   return data;
 }
 function run(action){return async event=>{event?.preventDefault();try{await action(event);}catch(error){toast(error.message);}};}
-function badge(value){const node=element('span',title(value),'pill');if(['ANALYZED','VALID','CONFIRMED'].includes(value))node.classList.add('good');else if(['ERROR','INVALID'].includes(value))node.classList.add('bad');else if(['QUEUED','PROCESSING','CANDIDATE'].includes(value))node.classList.add('warn');return node;}
+function badge(value){const node=element('span',title(value),'pill');if(['ANALYZED','VALID','CONFIRMED'].includes(value))node.classList.add('good');else if(['ERROR','INVALID'].includes(value))node.classList.add('bad');else if(['QUEUED','PROCESSING','CANDIDATE','NEEDS_CROP'].includes(value))node.classList.add('warn');return node;}
 function fields(node, values){node.replaceChildren();for(const [key,value] of values){node.append(element('dt',key),element('dd',value??'—'));}}
 
 async function refresh(){
   if(state.loading||$('loginDialog').open)return;
   state.loading=true;
   try{
-    const query=new URLSearchParams({limit:20,offset:state.offset,status:$('statusFilter').value,review:$('reviewFilter').value,query:$('search').value.trim()});
+    const query=new URLSearchParams({limit:20,offset:state.offset,status:$('statusFilter').value,review:$('reviewFilter').value,violation:$('violationFilter').value,query:$('search').value.trim()});
     const [list,overview]=await Promise.all([api('/v1/tasks?'+query),api('/v1/overview')]);
     state.records=list.tasks;renderRecords();
+    const admin=account?.role==='admin';
+    $('importButton').hidden=false;
+    $('archive').hidden=!admin;
+    $('usersButton').hidden=!admin;
+    $('settingsButton').hidden=!admin;
+    $('statReview').hidden=!admin;
+    $('statClients').hidden=!admin;
+    $('statWorker').hidden=!admin;
+    $('introLead').textContent=admin?'视频自动分析并回传手机。需要时，对尚未提交的记录进行人工干预。':'这里只显示你上传的视频。上方是你的记录数、服务器排队，以及这些视频里已经分析完成的数量。';
+    $('statTotalLabel').textContent=admin?'全部记录':'我的记录';
+    $('statQueueLabel').textContent=admin?'排队 / 分析中':'服务器排队';
     $('countTotal').textContent=overview.total;
-    $('countProcessing').textContent=(overview.counts.QUEUED||0)+(overview.counts.PROCESSING||0);
-    $('countDone').textContent=overview.counts.ANALYZED||0;$('countReview').textContent=overview.intervened;
-    const clients=overview.clients||[];
-    $('countClients').textContent=overview.client_count??clients.length;
-    $('clientList').textContent=clients.slice(0,8).map(c=>`${c.platform} · ${c.model} · ${c.ip||'—'}`).join('；')||'尚无客户端';
-    const online=overview.worker && Date.now()/1000-overview.worker.heartbeat<30;
-    $('workerState').textContent=online?'自动处理运行中':'工作进程未就绪';
-    $('workerDetail').textContent=online?(overview.worker.message.startsWith('处理中')?'正在分析视频':'等待新任务'):'API 已连接，请检查 worker';
-    $('connection').textContent='● 服务已连接';
+    $('countProcessing').textContent=overview.queue??((overview.counts.QUEUED||0)+(overview.counts.PROCESSING||0)+(overview.counts.NEEDS_CROP||0));
+    $('countDone').textContent=overview.counts.ANALYZED||0;
+    $('countReview').textContent=overview.intervened;
+    if(admin){
+      const clients=overview.clients||[];
+      $('countClients').textContent=overview.client_count??clients.length;
+      $('clientList').textContent=clients.slice(0,8).map(c=>`${c.platform} · ${c.model} · ${c.ip||'—'}`).join('；')||'尚无客户端';
+      const online=overview.worker && Date.now()/1000-overview.worker.heartbeat<30;
+      $('workerState').textContent=online?'自动处理运行中':'工作进程未就绪';
+      $('workerDetail').textContent=online?(overview.worker.message.startsWith('处理中')?'正在分析视频':'等待新任务'):'API 已连接，请检查 worker';
+    }
+    $('connection').textContent=account?`● ${account.username}`:'● 服务已连接';
+    if(account?.role==='admin' && account.retention_days && !$('usersDialog').open)$('retentionDays').value=account.retention_days;
     if(state.task){
       const task=await api('/v1/tasks/'+state.task.task_id);
       if(task.revision!==state.task.revision){if(state.dirty)$('changed').hidden=false;else await selectTask(task.task_id);}
@@ -89,8 +106,8 @@ function renderRecords(){
   for(const task of state.records){
     const item=element('button',undefined,'record'+(state.task?.task_id===task.task_id?' active':''));
     const top=element('div',undefined,'record-top');top.append(element('strong',task.effective_result?.plate||'车牌未确认'),badge(task.status));
-    item.append(top,element('div',`${title(task.metadata.trigger||'import')} · ${title(task.effective_result?.violation_type||'UNKNOWN')}`,'sub'),element('small',date(task.created_at)));
-    if(task.review)item.append(element('small',title(task.review.decision)));
+    item.append(top,element('div',`${title(task.metadata.trigger||'import')} · ${title(task.effective_result?.violation_type||'UNKNOWN')}`,'sub'),element('small',`${account?.role==='admin'?(task.uploader||'未标明用户')+' · ':''}${date(task.created_at)}`));
+    if(account?.role==='admin' && task.review)item.append(element('small',title(task.review.decision)));
     if(task.submission_status==='SUBMITTED')item.append(element('small','已提交 · 判定锁定'));
     item.onclick=run(async()=>{if(state.dirty&&!confirm('未保存的干预内容将丢弃，继续切换记录？'))return;state.dirty=false;await selectTask(task.task_id);});
     $('recordList').append(item);
@@ -104,17 +121,45 @@ async function selectTask(id){
   $('taskTime').textContent=date(task.created_at);$('taskTitle').textContent=title(task.metadata.trigger||'import')+' · '+(task.effective_result?.plate||'车牌未确认');
   $('taskId').textContent=task.event_id;$('taskStatus').replaceWith(Object.assign(badge(task.status),{id:'taskStatus'}));
   const ai=task.result||{},effective=task.effective_result||{};
-  fields($('aiResult'),[['车牌',ai.plate||'未确认'],['信号灯',title(ai.signal_state?.color)+(ai.signal_state?.stable?'（稳定）':'')],['红灯观察',ai.signal_approach?ai.signal_approach.reason:'尚无足够红灯采样'],['违法行为',title(ai.violation_type||'UNKNOWN')],['判断',title(ai.decision)],['原因',title(ai.reason)],['车辆模型',ai.model?.name||task.analysis_config?.vehicle_model||'—'],['车牌模型',ai.plate_model||'未启用 / 旧结果']]);
-  fields($('effectiveResult'),[['来源',effective.source==='HUMAN'?'人工干预':'自动判断'],['车牌',effective.plate||'未确认'],['违法行为',title(effective.violation_type||'UNKNOWN')],['状态',title(effective.review_status==='AUTOMATIC'?effective.decision:effective.review_status)],['提交',task.submission_status==='SUBMITTED'?'已提交，判定锁定':'尚未提交 · 可人工复核']]);
+  const adminView=account?.role==='admin';
+  const parking=task.metadata.candidate_type==='ILLEGAL_PARKING'||ai.reason==='PARKING_PHOTOS';
+  const rows=adminView?[['车牌',ai.plate||'未确认'],['所属用户',task.uploader||'未标明用户'],['信号灯',title(ai.signal_state?.color)+(ai.signal_state?.stable?'（稳定）':'')],['红灯观察',ai.signal_approach?ai.signal_approach.reason:'尚无足够红灯采样'],['违法行为',title(ai.violation_type||'UNKNOWN')],['口述原文',ai.transcript||'—'],['口述匹配',title(ai.spoken_type||'')],['判断',title(ai.decision)],['原因',title(ai.reason)],['车辆模型',ai.model?.name||task.analysis_config?.vehicle_model||'—'],['车牌模型',ai.plate_model||'未启用 / 旧结果']]
+    :[['车牌',ai.plate||'未确认'],['违法行为',title(ai.violation_type||'UNKNOWN')],['口述原文',ai.transcript||'—'],['口述匹配',title(ai.spoken_type||'')],['判断',title(ai.decision)],['原因',title(ai.reason)]];
+  fields($('aiResult'),rows);
+  fields($('effectiveResult'),adminView?[['来源',effective.source==='HUMAN'?'人工干预':'自动判断'],['车牌',effective.plate||'未确认'],['违法行为',title(effective.violation_type||'UNKNOWN')],['状态',title(effective.review_status==='AUTOMATIC'?effective.decision:effective.review_status)],['提交',task.submission_status==='SUBMITTED'?'已提交，判定锁定':'尚未提交 · 可人工复核']]
+    :[['车牌',effective.plate||'未确认'],['违法行为',title(effective.violation_type||'UNKNOWN')],['状态',title(effective.review_status==='AUTOMATIC'?effective.decision:effective.review_status)]]);
+  document.querySelector('.calibration').hidden=!adminView||parking;
+  document.querySelector('.history').hidden=!adminView;
+  $('reviewForm').hidden=!adminView;
   $('rawResult').textContent=JSON.stringify(ai,null,2);
   $('correctPlate').value=effective.plate||'';$('correctViolation').value=effective.violation_type||'UNKNOWN';$('reviewDecision').value=task.review?.decision||'VALID';$('reviewNote').value=task.review?.note||'';
   const editable=task.submission_status==='NOT_SUBMITTED'&&['ANALYZED','REJECTED','ERROR'].includes(task.status);
   $('reviewFields').disabled=!editable;$('reviewLock').textContent=editable?'自动结果已经生效，必要时在此纠正。':(task.submission_status==='SUBMITTED'?'已提交记录只读。':'分析完成后可进行人工干预。');
   $('reanalyze').disabled=!editable||task.status==='EXPIRED';$('fixedCamera').checked=!!state.scene.fixed_camera;
   $('videoError').hidden=true;$('download').href=`/v1/tasks/${id}/video?original=true`;
-  if(changedVideo){mediaRetry=false;state.clipStart=0;$('video').src=`/v1/tasks/${id}/video`;$('video').load();}
-  $('videoInfo').textContent=ai.video?`${ai.video.width}×${ai.video.height} · ${ai.video.duration_seconds.toFixed(1)} 秒 · ${ai.sampled_frames} 采样帧`:title(task.status);
+  $('cropBox').hidden=task.status!=='NEEDS_CROP'||account?.role!=='admin';
+  $('parkingPhotos').hidden=!parking;$('parkingMeta').hidden=!parking;
+  document.querySelector('.video-wrap').hidden=parking;$('boxToggle').hidden=parking;
+  $('download').textContent=parking?'下载原片包':'下载原片';
+  if(parking){
+    $('video').removeAttribute('src');$('video').load();
+    const place=task.metadata.location,note=(task.metadata.location_note||'').trim();
+    const rows=[['地址',place?.address||'未记录'],['坐标',place?`${Number(place.latitude).toFixed(6)}, ${Number(place.longitude).toFixed(6)}`:'无 GPS']];
+    if(note)rows.push(['位置备注',note]);
+    if(task.metadata.capture?.captured_at)rows.push(['拍摄时间',date(task.metadata.capture.captured_at)]);
+    rows.push(['车牌',ai.plate||'未确认']);
+    fields($('parkingMeta'),rows);
+    for(const [el,name] of [['photoRear','spot'],['photoFront','front']]){
+      $(el).onerror=()=>{$('videoError').textContent='照片无法显示';$('videoError').hidden=false;};
+      $(el).src=`/v1/tasks/${id}/photos/${name}`;
+    }
+  }else if(changedVideo){mediaRetry=false;state.clipStart=0;$('video').src=`/v1/tasks/${id}/video`;$('video').load();
+    $('photoRear').removeAttribute('src');$('photoFront').removeAttribute('src');}
+  $('videoInfo').textContent=parking?'车尾、车头原片':(ai.video?`${ai.video.width}×${ai.video.height} · ${ai.video.duration_seconds.toFixed(1)} 秒 · ${ai.sampled_frames} 采样帧`:title(task.status));
   $('plateEvidence').replaceChildren();
+  if(parking){
+    $('plateEvidence').append(element('p',ai.plate?`两张照片车牌一致：${ai.plate}`:'车牌未写入结果','muted'));
+  }else{
   const plates=[...(ai.plates||[])].sort((a,b)=>plateTrust(b)-plateTrust(a)||(b.hits||0)-(a.hits||0));
   plates.forEach((plate,index)=>{
     const t=plates.length===1?1:1-index/(plates.length-1);
@@ -126,6 +171,7 @@ async function selectTask(id){
     $('plateEvidence').append(b);
   });
   if(!plates.length)$('plateEvidence').append(element('p','尚无满足阈值的中文车牌。小尺寸、模糊或非中国大陆车牌可能无法识别。','muted'));
+  }
   $('violations').replaceChildren();
   for(const violation of ai.violations||[]){const card=element('div',undefined,'candidate');card.append(element('strong',title(violation.type)),element('p',`${violation.plate||'车牌未关联'} · 轨迹${violation.track_id??'—'} · ${violation.reason}`));const b=element('button',violation.clip_index!=null?`看裁剪 ${Number(violation.clip_start).toFixed(1)}–${Number(violation.clip_end).toFixed(1)} 秒`:`定位 ${violation.time_seconds.toFixed(1)} 秒`);b.onclick=()=>{if(violation.clip_index!=null){state.clipStart=violation.clip_start||0;$('video').src=`/v1/tasks/${id}/clips/${violation.clip_index}`;$('video').load();$('video').play();}else{$('video').currentTime=violation.time_seconds;$('video').pause();}};card.append(b);$('violations').append(card);}
   if(!ai.violations?.length)$('violations').append(element('p',title(ai.rule_assessment||ai.reason||'UNKNOWN'),'muted'));
@@ -144,29 +190,32 @@ function draw(){
       const [x1,y1,x2,y2]=detection.box_normalized;ctx.strokeStyle=detection.color;ctx.lineWidth=1.5;ctx.strokeRect(box.x+x1*box.w,box.y+y1*box.h,(x2-x1)*box.w,(y2-y1)*box.h);ctx.font='12px sans-serif';const text=detection.text,labelWidth=ctx.measureText(text).width+9;const tx=Math.max(0,Math.min(box.x+x1*box.w,canvas.width-labelWidth)),ty=Math.max(16,box.y+y1*box.h);ctx.fillStyle='#10232de0';ctx.fillRect(tx,ty-15,labelWidth,16);ctx.fillStyle=detection.color;ctx.fillText(text,tx+4,ty-3);
     }
   }
-  for(const [key,color] of [['solid_line','#ffcc66'],['allowed_direction','#7cd8a9']]){const line=state.scene[key];if(!line)continue;ctx.strokeStyle=color;ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(box.x+line[0][0]*box.w,box.y+line[0][1]*box.h);ctx.lineTo(box.x+line[1][0]*box.w,box.y+line[1][1]*box.h);ctx.stroke();ctx.fillStyle=color;ctx.fillText(key==='solid_line'?'实线':'允许方向 →',box.x+line[1][0]*box.w,box.y+line[1][1]*box.h-8);}
+  const sceneLabel={solid_line:'实线',allowed_direction:'允许方向 →',stop_line:'停止线',lane_line:'分道线',emergency_edge:'应急边缘'};
+  for(const [key,color] of [['solid_line','#ffcc66'],['stop_line','#ff8a80'],['lane_line','#9ecbff'],['emergency_edge','#e0b0ff'],['allowed_direction','#7cd8a9']]){const line=state.scene[key];if(!line)continue;ctx.strokeStyle=color;ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(box.x+line[0][0]*box.w,box.y+line[0][1]*box.h);ctx.lineTo(box.x+line[1][0]*box.w,box.y+line[1][1]*box.h);ctx.stroke();ctx.fillStyle=color;ctx.fillText(sceneLabel[key],box.x+line[1][0]*box.w,box.y+line[1][1]*box.h-8);}
   for(const point of state.points){ctx.fillStyle='#ffcc66';ctx.beginPath();ctx.arc(box.x+point[0]*box.w,box.y+point[1]*box.h,5,0,Math.PI*2);ctx.fill();}
 }
-function calibrationHint(){ $('calibrationHint').textContent=state.draw?'请在视频中点击两点，标定完成后重新分析。':`实线：${state.scene.solid_line?'已标定':'未标定'} · 通行方向：${state.scene.allowed_direction?'已标定':'未标定'}`;document.querySelector('.video-wrap').classList.toggle('calibrating',!!state.draw); }
+function calibrationHint(){ const mark=key=>state.scene[key]?'已标定':'未标定'; $('calibrationHint').textContent=state.draw?'请在视频中点击两点，标定完成后重新分析。':`实线：${mark('solid_line')} · 停止线：${mark('stop_line')} · 分道线：${mark('lane_line')} · 应急边缘：${mark('emergency_edge')} · 通行方向：${mark('allowed_direction')}`;document.querySelector('.video-wrap').classList.toggle('calibrating',!!state.draw); }
 $('overlay').onclick=event=>{if(!state.draw)return;const rect=$('overlay').getBoundingClientRect(),box=layout();const point=[(event.clientX-rect.left-box.x)/box.w,(event.clientY-rect.top-box.y)/box.h];if(point.some(x=>x<0||x>1))return;state.points.push(point.map(x=>Math.round(x*10000)/10000));if(state.points.length===2){state.scene[state.draw]=state.points;state.points=[];state.draw=null;state.dirty=true;calibrationHint();}draw();};
 $('video').addEventListener('timeupdate',draw);$('video').addEventListener('loadedmetadata',draw);new ResizeObserver(draw).observe($('video'));$('showBoxes').onchange=draw;
 $('video').addEventListener('loadeddata',()=>{$('videoError').hidden=true;});
 $('video').onerror=async()=>{
+  if(!$('parkingPhotos').hidden)return;
   if(!mediaRetry){
     mediaRetry=true;session='';
     try{await ensureSession();$('video').load();return;}catch{}
   }
   $('videoError').textContent='视频预览暂不可用，可能正在生成或视频已过期。可刷新任务或下载原片。';$('videoError').hidden=false;
 };
-$('drawLine').onclick=()=>{state.draw='solid_line';state.points=[];$('video').pause();calibrationHint();};$('drawDirection').onclick=()=>{state.draw='allowed_direction';state.points=[];$('video').pause();calibrationHint();};
+$('drawLine').onclick=()=>{state.draw='solid_line';state.points=[];$('video').pause();calibrationHint();};$('drawStop').onclick=()=>{state.draw='stop_line';state.points=[];$('video').pause();calibrationHint();};$('drawLane').onclick=()=>{state.draw='lane_line';state.points=[];$('video').pause();calibrationHint();};$('drawEdge').onclick=()=>{state.draw='emergency_edge';state.points=[];$('video').pause();calibrationHint();};$('drawDirection').onclick=()=>{state.draw='allowed_direction';state.points=[];$('video').pause();calibrationHint();};
 $('clearScene').onclick=()=>{state.scene={};state.draw=null;state.points=[];state.dirty=true;$('fixedCamera').checked=false;calibrationHint();draw();};$('fixedCamera').onchange=()=>{state.scene.fixed_camera=$('fixedCamera').checked;state.dirty=true;};
 $('reviewForm').oninput=()=>state.dirty=true;
 $('reviewForm').onsubmit=run(async()=>{const task=state.task;const body={expected_revision:task.revision,decision:$('reviewDecision').value,plate:$('correctPlate').value.trim().toUpperCase(),violation_type:$('correctViolation').value,reviewer:$('reviewer').value.trim(),note:$('reviewNote').value.trim()};await api(`/v1/tasks/${task.task_id}/review`,{method:'POST',json:body});state.dirty=false;await selectTask(task.task_id);toast('人工结果已保存，手机会自动同步。');await refresh();});
 $('reanalyze').onclick=run(async()=>{if(!state.task)return;const settings=await api('/v1/settings');await api(`/v1/tasks/${state.task.task_id}/reanalyze`,{method:'POST',json:{expected_revision:state.task.revision,config:settings.config,scene:{...state.scene,fixed_camera:$('fixedCamera').checked}}});state.dirty=false;await selectTask(state.task.task_id);toast('已重新排队，将自动分析并回传。');});
+$('cropButton').onclick=run(async()=>{if(!state.task)return;const task=await api(`/v1/tasks/${state.task.task_id}/crop`,{method:'POST',json:{expected_revision:state.task.revision,start_seconds:Number($('cropStart').value),end_seconds:Number($('cropEnd').value)}});state.task=task;await selectTask(task.task_id);toast('已裁剪，开始分析。');});
 $('reloadTask').onclick=run(async()=>{state.dirty=false;await selectTask(state.task.task_id);});
 $('archive').onclick=run(async()=>{if(!confirm('归档将清除当前全部记录和视频，且不可恢复。继续？'))return;const out=await api('/v1/archive',{method:'POST'});state.task=null;state.records=[];state.clipStart=0;$('selected').hidden=true;$('empty').hidden=false;$('video').removeAttribute('src');$('video').load();await refresh();toast(`已归档 ${out.archived} 条记录`);});
 $('pair').onclick=run(async()=>{const out=await api('/v1/device-pair',{method:'POST'});toast(`在手机「访问令牌」填入：${out.code}（30分钟有效）`);});
-$('refresh').onclick=run(refresh);for(const id of ['statusFilter','reviewFilter'])$(id).onchange=()=>{state.offset=0;refresh();};$('search').oninput=()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>{state.offset=0;refresh();},300);};
+$('refresh').onclick=run(refresh);for(const id of ['statusFilter','reviewFilter','violationFilter'])$(id).onchange=()=>{state.offset=0;refresh();};$('search').oninput=()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>{state.offset=0;refresh();},300);};
 $('previous').onclick=()=>{state.offset=Math.max(0,state.offset-20);refresh();};$('next').onclick=()=>{state.offset+=20;refresh();};
 $('settingsButton').onclick=run(async()=>{state.config=await api('/v1/settings');const c=state.config.config;$('vehicleModel').replaceChildren();for(const model of state.config.models){const o=element('option',model.name+(model.installed?'':'（未下载）'));o.value=model.id;o.disabled=!model.installed;$('vehicleModel').append(o);}$('vehicleModel').value=c.vehicle_model;$('plateModel').replaceChildren();for(const model of state.config.plate_models||[]){const o=element('option',model.name+(model.installed?'':'（未下载）'));o.value=model.id;o.disabled=!model.installed;$('plateModel').append(o);}$('plateModel').value=c.plate_model||'hyperlpr3';for(const [id,key] of [['vehicleThreshold','vehicle_threshold'],['sampleFps','sample_fps'],['plateThreshold','plate_threshold'],['plateMinHits','plate_min_hits'],['threads','threads']])$(id).value=c[key];$('plateEnabled').checked=c.plate_enabled;$('rulesEnabled').checked=c.rules_enabled;$('modelReadiness').textContent=(state.config.plate_models||[]).filter(m=>m.installed).map(m=>m.name).join('；')||'车牌模型尚未下载';prepareSettingsAccess();$('settingsDialog').showModal();});
 let settingsBusy=false, settingsCooldown=0, settingsTimer=0;
@@ -205,8 +254,55 @@ $('closeSettings').onclick=()=>$('settingsDialog').close();
 $('settingsDialog').addEventListener('close',()=>{$('settingsPassword').value='';clearInterval(settingsTimer);});
 $('settingsDialog').addEventListener('cancel',()=>{$('settingsPassword').value='';});
 $('loginDialog').addEventListener('cancel',event=>event.preventDefault());
-$('loginForm').onsubmit=async event=>{event.preventDefault();$('loginError').textContent='';try{await api('/v1/session',{method:'POST',headers:{Authorization:'Bearer '+$('token').value.trim()}});$('token').value='';$('loginDialog').close();await refresh();}catch(error){$('loginError').textContent=error.message;}};
-$('logout').onclick=run(async()=>{await api('/v1/session',{method:'DELETE'});state.task=null;state.records=[];$('selected').hidden=true;$('empty').hidden=false;$('video').removeAttribute('src');$('video').load();$('recordList').replaceChildren();$('loginDialog').showModal();});
-$('importButton').onclick=()=>$('videoFile').click();$('videoFile').onchange=run(async()=>{const file=$('videoFile').files[0];if(!file)return;if(file.size>50*1024*1024)throw new Error('视频超过 50 MiB');$('importButton').disabled=true;try{const body=await file.arrayBuffer();const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',body)),n=>n.toString(16).padStart(2,'0')).join('');const task=await api('/v1/tasks',{method:'POST',body,headers:{'Content-Type':'video/mp4','X-Video-SHA256':hash,'X-Event-Metadata':JSON.stringify({event_id:crypto.randomUUID(),trigger:'import',manual_review:false})}});state.offset=0;await selectTask(task.task_id);await refresh();toast('视频已上传，正在自动处理。');}finally{$('importButton').disabled=false;$('videoFile').value='';}});
+$('loginForm').onsubmit=async event=>{
+  event.preventDefault();$('loginError').textContent='';
+  const body={username:$('username').value.trim(),password:$('password').value};
+  const response=await fetch($('loginForm').dataset.mode==='bootstrap'?'/v1/bootstrap':'/v1/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const data=await response.json();
+  if(!response.ok){$('loginError').textContent=typeof data.detail==='string'?data.detail:'登录失败';return;}
+  $('password').value='';session='cookie';
+  account=await fetch('/v1/account',{credentials:'same-origin',headers:{'X-Requested-With':'traffic-console'}}).then(response=>response.json());
+  $('loginDialog').close();await refresh();
+};
+function renderUsers(users){
+  const list=$('userList');
+  list.replaceChildren();
+  if(!users?.length){list.append(element('p','还没有账户。','muted'));return;}
+  for(const user of users){
+    const row=element('div',undefined,'user-row');
+    row.append(element('span',`${user.username} · ${user.role==='admin'?'管理员':'取证用户'}${user.disabled?' · 已停用':''}`));
+    if(user.role!=='admin' && !user.disabled){
+      const button=element('button','停用');
+      button.type='button';
+      button.onclick=run(async()=>{
+        await api('/v1/users/'+encodeURIComponent(user.username)+'/disable',{method:'POST',json:{}});
+        const me=await api('/v1/account');
+        account=me;
+        renderUsers(me.users);
+        toast(`已停用 ${user.username}`);
+      });
+      row.append(button);
+    }
+    list.append(row);
+  }
+}
+$('usersButton').onclick=run(async()=>{
+  const me=await api('/v1/account');
+  account=me;
+  if(me.retention_days)$('retentionDays').value=me.retention_days;
+  $('inviteToken').textContent='';
+  renderUsers(me.users);
+  $('usersDialog').showModal();
+});
+$('closeUsers').onclick=()=>$('usersDialog').close();
+$('invite').onclick=run(async()=>{
+  const data=await api('/v1/invites',{method:'POST',json:{}});
+  const link=location.origin+'/join?token='+encodeURIComponent(data.token);
+  $('inviteToken').textContent=link;
+  try{await navigator.clipboard.writeText(link);toast('邀请链接已复制');}catch{toast('请复制下面的邀请链接');}
+});
+$('saveRetention').onclick=run(async()=>{const data=await api('/v1/retention',{method:'PUT',json:{days:Number($('retentionDays').value)}});if(account)account.retention_days=data.retention_days;toast(`视频保留 ${data.retention_days} 天`);});
+$('logout').onclick=run(async()=>{await api('/v1/session',{method:'DELETE'});account=null;session='';if($('usersDialog').open)$('usersDialog').close();state.task=null;state.records=[];$('selected').hidden=true;$('empty').hidden=false;$('video').removeAttribute('src');$('video').load();$('recordList').replaceChildren();const boot=await fetch('/v1/bootstrap').then(response=>response.json());showLogin(!!boot.needs_admin);});
+$('importButton').onclick=()=>$('videoFile').click();$('videoFile').onchange=run(async()=>{const file=$('videoFile').files[0];if(!file)return;if(account?.role!=='admin' && file.size>50*1024*1024)throw new Error('普通用户导入不能超过 50MB');$('importButton').disabled=true;try{const body=await file.arrayBuffer();const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',body)),n=>n.toString(16).padStart(2,'0')).join('');const task=await api('/v1/tasks',{method:'POST',body,headers:{'Content-Type':'video/mp4','X-Video-SHA256':hash,'X-Event-Metadata':JSON.stringify({event_id:crypto.randomUUID(),trigger:'import',manual_review:false})}});state.offset=0;await selectTask(task.task_id);await refresh();toast('视频已上传，正在自动处理。');}finally{$('importButton').disabled=false;$('videoFile').value='';}});
 refresh();setInterval(refresh,4000);
-$('logout').hidden=true;$('pair').hidden=true;
+$('pair').hidden=true;

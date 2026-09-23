@@ -250,10 +250,10 @@ def red_approaches(frames, plate_texts=None):
 
 
 def red_light_candidate(signal_state, approach, plates, plate_text=None):
-    """三条件同时成立才给候选：稳定红灯、红灯期间继续接近、车牌多帧一致。不是法律证明。"""
+    """稳定红灯、车辆越过稳定停止线、车牌多帧一致。画面里的车在动不是越线。"""
     if not signal_state or signal_state.get('color')!='RED' or not signal_state.get('stable'):
         return None
-    if not approach or not (approach.get('proceeding') or approach.get('approaching')):
+    if not approach or not approach.get('crossed_stop_line'):
         return None
     plate=plate_text or approach.get('plate') or next((p['text'] for p in plates if p.get('stable') and p.get('text')), None)
     if not plate:
@@ -261,9 +261,9 @@ def red_light_candidate(signal_state, approach, plates, plate_text=None):
     return {
         'type':'RED_LIGHT','track_id':approach['track_id'],
         'time_seconds':approach.get('time_seconds') or signal_state.get('since_seconds') or 0,
-        'confidence':round(min(.8, .4+approach['frames']*.03),4),
+        'confidence':round(min(.8, .4+approach.get('frames', 1)*.03),4),
         'plate':plate,
-        'reason':'红灯稳定、红灯期间车辆仍在移动、车牌多帧一致；移动机位无法确认停止线，仅作候选',
+        'reason':'红灯稳定且车辆底边越过停止线，车牌多帧一致；停止线在画面中滑动时不记越线',
     }
 
 
@@ -311,12 +311,14 @@ def turned_from_green(frames, track_id, time_seconds, span=4):
     return bool(colors) and colors.count('GREEN')>=max(1, colors.count('RED'))
 
 
-def red_during_laterals(frames, laterals, seen=None):
-    """同一红灯下，每条变道轨迹一张闯红灯候选；左转绿转红不报；不覆盖已有红灯卡。"""
+def red_during_laterals(frames, laterals, seen=None, crossed=None):
+    """变道轨迹只有同时越过停止线才记闯红灯。没有停止线就不记。"""
+    if not crossed:
+        return []
     taken=set(seen or ())
     extra=[]
     for item in laterals:
-        if item['track_id'] in taken:
+        if item['track_id'] in taken or item['track_id'] not in crossed:
             continue
         if turned_from_green(frames, item['track_id'], item['time_seconds']):
             continue
@@ -326,7 +328,7 @@ def red_during_laterals(frames, laterals, seen=None):
             extra.append({
                 'type':'RED_LIGHT','track_id':item['track_id'],
                 'time_seconds':item['time_seconds'],'confidence':0.45,
-                'reason':'本向红灯期间横向变道；未确认停止线与转向灯，仅作候选',
+                'reason':'本向红灯期间越过停止线并横向变道，仅作候选',
             })
             taken.add(item['track_id'])
     return extra
@@ -360,3 +362,335 @@ def restricted_park(frames):
             'reason':'右侧停驻时间较长，疑似占用非机动车道，需结合车道线复核',
         })
     return result
+
+
+def _longest_run(mask):
+    best = run = 0
+    for bit in mask:
+        if bit:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
+def stop_y_of(gray):
+    """Bright thin horizontal line. Returns normalized y, or None."""
+    height, width = gray.shape
+    best, row_at = 0, None
+    values = gray.astype(np.int16)
+    for row in range(int(height * .40), int(height * .82)):
+        line = values[row]
+        above = values[max(0, row - 2)]
+        below = values[min(height - 1, row + 2)]
+        bright = (line > above + 18) & (line > below + 18) & (line > 90)
+        run = _longest_run(bright)
+        if run > best:
+            best, row_at = run, row
+    if row_at is None or best < width * .35:
+        return None
+    return row_at / height
+
+
+def _line_solid(gray, x1, y1, x2, y2):
+    height, width = gray.shape
+    hits = 0
+    for step in range(8):
+        x = int(round(x1 + (x2 - x1) * step / 7))
+        y = int(round(y1 + (y2 - y1) * step / 7))
+        if not (0 <= x < width and 0 <= y < height):
+            continue
+        patch = gray[max(0, y - 1):y + 2, max(0, x - 1):x + 2]
+        if patch.size and int(patch.max()) > 90:
+            hits += 1
+    return hits >= 6
+
+
+def lane_lines_of(gray):
+    """Nearly vertical bright lines. Horizontal stop lines are not lane lines."""
+    height, width = gray.shape
+    edges = cv2.Canny(gray, 50, 120)
+    edges[:int(height * .35), :] = 0
+    found = cv2.HoughLinesP(edges, 1, np.pi / 180, 18, minLineLength=max(12, height // 5), maxLineGap=6)
+    lines = []
+    if found is None:
+        return lines
+    for x1, y1, x2, y2 in np.asarray(found).reshape(-1, 4):
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        if abs(y2 - y1) < abs(x2 - x1) * .8:
+            continue
+        lines.append({
+            'a': [x1 / width, y1 / height], 'b': [x2 / width, y2 / height],
+            'solid': _line_solid(gray, x1, y1, x2, y2),
+        })
+    return lines[:8]
+
+
+def frame_marks(image):
+    small = cv2.resize(image, (160, 90), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return {'stop_y': stop_y_of(gray), 'lines': lane_lines_of(gray)}
+
+
+def lamp_off(image, box):
+    """True when the rear-lamp strips are visible and not amber. None if the box is too small to see a lamp."""
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(width, int(x2)), min(height, int(y2))
+    if x2 - x1 < 24 or y2 - y1 < 24:
+        return None
+    span = max(1, (x2 - x1) // 5)
+
+    def amber(strip):
+        if strip.size == 0:
+            return False
+        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (8, 80, 120), (32, 255, 255))
+        return float(mask.mean()) > 8
+
+    left = image[y1:y2, x1:x1 + span]
+    right = image[y1:y2, x2 - span:x2]
+    if amber(left) or amber(right):
+        return False
+    return True
+
+
+def stop_crossings(frames):
+    """Track ids whose bottom crosses a stop line that stays put in the image."""
+    ids = set()
+
+    def flush(run):
+        if len(run) < 4:
+            return
+        ys = [frames[i]['stop_y'] for i in run]
+        if max(ys) - min(ys) > .03:
+            return
+        if frames[run[-1]]['time_seconds'] - frames[run[0]]['time_seconds'] < .6:
+            return
+        line = float(np.median(ys))
+        tracks = {}
+        for index in run:
+            frame = frames[index]
+            if 'signal_observed' in frame or 'signal_color' in frame:
+                if frame.get('signal_observed') != 'RED' and frame.get('signal_color') != 'RED':
+                    continue
+            for vehicle in frame.get('vehicles') or []:
+                tracks.setdefault(vehicle['track_id'], []).append(vehicle['box_normalized'][3])
+        for track_id, bottoms in tracks.items():
+            for earlier, later in zip(bottoms, bottoms[1:]):
+                if (earlier - line) * (later - line) < 0 and abs(earlier - line) + abs(later - line) > .02:
+                    ids.add(track_id)
+                    break
+
+    run = []
+    for index, frame in enumerate(frames):
+        y = frame.get('stop_y')
+        if y is None or (run and frame['time_seconds'] - frames[run[-1]]['time_seconds'] > 1):
+            flush(run)
+            run = []
+        if y is not None:
+            run.append(index)
+    flush(run)
+    return ids
+
+
+def _bottom_center(vehicle):
+    x1, y1, x2, y2 = vehicle['box_normalized']
+    return ((x1 + x2) / 2, y2)
+
+
+def _signed_line(point, line):
+    ax, ay = line['a']
+    bx, by = line['b']
+    dx, dy = bx - ax, by - ay
+    length = (dx * dx + dy * dy) ** .5
+    if length < 1e-6:
+        return 0.0
+    return (dx * (point[1] - ay) - dy * (point[0] - ax)) / length
+
+
+def _match_lines(previous, current):
+    used = set()
+    pairs = []
+    for left in previous:
+        best, distance = None, .05
+        lax, lay = left['a']
+        lbx, lby = left['b']
+        ldx, ldy = lbx - lax, lby - lay
+        ln = (ldx * ldx + ldy * ldy) ** .5 or 1
+        lmx, lmy = (lax + lbx) / 2, (lay + lby) / 2
+        for index, right in enumerate(current):
+            if index in used:
+                continue
+            rax, ray = right['a']
+            rbx, rby = right['b']
+            rdx, rdy = rbx - rax, rby - ray
+            rn = (rdx * rdx + rdy * rdy) ** .5 or 1
+            if abs((ldx * rdx + ldy * rdy) / (ln * rn)) < .97:
+                continue
+            gap = (((rax + rbx) / 2 - lmx) ** 2 + ((ray + rby) / 2 - lmy) ** 2) ** .5
+            if gap < distance:
+                best, distance = index, gap
+        if best is not None:
+            used.add(best)
+            pairs.append((left, current[best]))
+    return pairs
+
+
+def _passed(previous, current, track_id):
+    def bottoms(frame):
+        return {v['track_id']: v['box_normalized'][3] for v in frame.get('vehicles') or []}
+    before, after = bottoms(previous), bottoms(current)
+    mine0, mine1 = before.get(track_id), after.get(track_id)
+    if mine0 is None or mine1 is None:
+        return False
+    for other, y0 in before.items():
+        if other == track_id or other not in after:
+            continue
+        if mine0 > y0 + .02 and mine1 < after[other] - .02:
+            return True
+    return False
+
+
+def _x_on_line(line, y):
+    ax, ay = line['a']
+    bx, by = line['b']
+    if abs(by - ay) < 1e-6:
+        return (ax + bx) / 2
+    t = min(1, max(0, (y - ay) / (by - ay)))
+    return ax + t * (bx - ax)
+
+
+def drive_events(frames, motion_status='INSUFFICIENT_BACKGROUND'):
+    """Lane-relative candidates. 危险变道 and 加塞 have no geometry here until their rules exist.
+    A line that is not the same line on the next frame is ego-motion, not a crossing.
+    """
+    result = []
+    solid_done, over_done, signal_done = set(), set(), set()
+    for index in range(1, len(frames)):
+        previous, current = frames[index - 1], frames[index]
+        if current['time_seconds'] - previous['time_seconds'] > 1.2:
+            continue
+        pairs = _match_lines(previous.get('lines') or [], current.get('lines') or [])
+        if not pairs:
+            continue
+        before = {v['track_id']: v for v in previous.get('vehicles') or []}
+        after = {v['track_id']: v for v in current.get('vehicles') or []}
+        for track_id, first in before.items():
+            second = after.get(track_id)
+            if not second:
+                continue
+            p0, p1 = _bottom_center(first), _bottom_center(second)
+            for line0, line1 in pairs:
+                s0, s1 = _signed_line(p0, line0), _signed_line(p1, line1)
+                if s0 * s1 >= 0 or abs(s0) + abs(s1) <= .04:
+                    continue
+                solid = bool(line0.get('solid') and line1.get('solid'))
+                when = current['time_seconds']
+                if solid and track_id not in solid_done:
+                    result.append({'type': 'SOLID_LINE', 'track_id': track_id, 'time_seconds': when,
+                        'confidence': .5, 'reason': '车辆底边越过画面中稳定的实线'})
+                    solid_done.add(track_id)
+                if not solid and track_id not in over_done and _passed(previous, current, track_id):
+                    result.append({'type': 'OVERTAKE', 'track_id': track_id, 'time_seconds': when,
+                        'confidence': .45, 'reason': '越过虚线并超过相邻车辆'})
+                    over_done.add(track_id)
+                lamps = (first.get('signal_off'), second.get('signal_off'))
+                if track_id not in signal_done and lamps == (True, True):
+                    result.append({'type': 'NO_SIGNAL', 'track_id': track_id, 'time_seconds': when,
+                        'confidence': .4, 'reason': '越过车道线，车尾灯区域可见且没有琥珀色转向灯'})
+                    signal_done.add(track_id)
+    result.extend(_emergency(frames))
+    if motion_status == 'STATIONARY':
+        result.extend(_wrong_way(frames))
+    return result
+
+
+def _emergency(frames):
+    """Right of the rightmost stable solid edge, and still moving, is the shoulder."""
+    found = []
+    seen = set()
+    for index, frame in enumerate(frames):
+        solids = [line for line in frame.get('lines') or [] if line.get('solid')]
+        solids = [line for line in solids if abs(line['b'][0] - line['a'][0]) <= abs(line['b'][1] - line['a'][1])]
+        if not solids:
+            continue
+        edge = max(solids, key=lambda line: (line['a'][0] + line['b'][0]) / 2)
+        for vehicle in frame.get('vehicles') or []:
+            track_id = vehicle['track_id']
+            if track_id in seen:
+                continue
+            window = frames[index:index + 4]
+            if len(window) < 4 or window[-1]['time_seconds'] - frame['time_seconds'] < 1:
+                continue
+            points = []
+            for sample in window:
+                match = next((v for v in sample.get('vehicles') or [] if v['track_id'] == track_id), None)
+                sample_edge = next((line for line in sample.get('lines') or [] if line.get('solid')
+                    and abs((line['a'][0] + line['b'][0]) / 2 - (edge['a'][0] + edge['b'][0]) / 2) < .05), None)
+                if not match or not sample_edge:
+                    points = []
+                    break
+                x1, y1, x2, y2 = match['box_normalized']
+                points.append(((x1 + x2) / 2, y2, _x_on_line(sample_edge, y2)))
+            if len(points) < 4:
+                continue
+            if min(x - line_x for x, _, line_x in points) <= .03:
+                continue
+            if abs(points[-1][1] - points[0][1]) < .04:
+                continue
+            found.append({'type': 'EMERGENCY_LANE', 'track_id': track_id,
+                'time_seconds': window[-1]['time_seconds'], 'confidence': .4,
+                'reason': '车辆在最右侧实线以外继续行驶'})
+            seen.add(track_id)
+    return found
+
+
+def _wrong_way(frames):
+    tracks = {}
+    for frame in frames:
+        for vehicle in frame.get('vehicles') or []:
+            x1, y1, x2, y2 = vehicle['box_normalized']
+            tracks.setdefault(vehicle['track_id'], []).append((frame['time_seconds'], (x1 + x2) / 2, y2))
+    moves = {}
+    for track_id, points in tracks.items():
+        if len(points) < 4 or points[-1][0] - points[0][0] < 1:
+            continue
+        moves[track_id] = np.array([points[-1][1] - points[0][1], points[-1][2] - points[0][2]])
+    if len(moves) < 3:
+        return []
+    result = []
+    for track_id, vector in moves.items():
+        others = [moves[i] for i in moves if i != track_id]
+        median = np.median(others, axis=0)
+        if np.linalg.norm(vector) < .08 or np.linalg.norm(median) < .05:
+            continue
+        cosine = float(np.dot(vector, median) / (np.linalg.norm(vector) * np.linalg.norm(median)))
+        if cosine < -.75:
+            result.append({'type': 'WRONG_WAY', 'track_id': track_id,
+                'time_seconds': tracks[track_id][-1][0], 'confidence': .4,
+                'reason': '固定机位下该车方向与其余车辆相反'})
+    return result
+
+
+def calibrated_marks(frames, scene, motion_status):
+    """Fixed-camera lines drawn by the operator. Ignored while the camera is moving."""
+    if motion_status != 'STATIONARY' or not scene or not scene.get('fixed_camera'):
+        return frames
+    extra = []
+    for key, solid in (('lane_line', False), ('emergency_edge', True)):
+        segment = scene.get(key)
+        if segment:
+            extra.append({'a': [segment[0][0], segment[0][1]], 'b': [segment[1][0], segment[1][1]], 'solid': solid})
+    if not extra and not (scene.get('stop_line') and abs(scene['stop_line'][0][1] - scene['stop_line'][1][1]) <= .2):
+        return frames
+    stop = None
+    if scene.get('stop_line') and abs(scene['stop_line'][0][1] - scene['stop_line'][1][1]) <= .2:
+        stop = (scene['stop_line'][0][1] + scene['stop_line'][1][1]) / 2
+    stamped = []
+    for frame in frames:
+        lines = [*(frame.get('lines') or []), *extra]
+        stamped.append({**frame, 'lines': lines, 'stop_y': stop if stop is not None else frame.get('stop_y')})
+    return stamped
